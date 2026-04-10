@@ -1237,13 +1237,13 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
                         raw["phone"] = raw.get("phone") or extra["phone"]
                         raw["owner"] = raw.get("owner") or extra["owner"]
 
-                    # FILTER: Owner name required UNLESS lead has BOTH email AND phone
+                    # FILTER: Owner name required UNLESS lead has email OR phone
                     has_owner = bool(raw.get("owner", "").strip())
                     has_email = bool(raw.get("email", "").strip())
                     has_phone = bool(raw.get("phone", "").strip())
 
-                    if not has_owner and not (has_email and has_phone):
-                        print(f"   SKIP (no name + missing email or phone): {raw['name']}")
+                    if not has_owner and not (has_email or has_phone):
+                        print(f"   SKIP (no name, no email, no phone): {raw['name']}")
                         skipped_no_name += 1
                         continue
 
@@ -1251,9 +1251,9 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
 
                     # Flag no-name leads for enrichment by cold email agent
                     if not has_owner:
-                        prospect["action"] = "Find owner name (has email+phone)"
+                        prospect["action"] = "Needs enrichment (no owner name)"
                         saved_no_name += 1
-                        print(f"   SAVED (no name, has email+phone): {raw['name']}")
+                        print(f"   SAVED (no name, has contact info): {raw['name']}")
 
                     all_leads.append(prospect)
                     existing.add(norm_name)
