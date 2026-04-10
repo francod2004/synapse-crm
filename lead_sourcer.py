@@ -1193,6 +1193,10 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
     skipped_chain = 0
     saved_no_name = 0
 
+    # Shuffle verticals so each daily run covers different industries
+    verticals = list(verticals)
+    random.shuffle(verticals)
+
     for v_name in verticals:
         # Smart area selection
         if use_smart_areas:
