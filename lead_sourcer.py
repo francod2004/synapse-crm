@@ -20,7 +20,7 @@ Usage:
     python lead_sourcer.py --vertical Restaurants --area "Brampton, ON" --max 10
     python lead_sourcer.py --dry-run           # Preview without writing to DB
 
-Requires env vars or .env file — see .env.template
+Requires env vars or .env file -- see .env.template
 """
 
 import os, sys, re, json, time, random, argparse, hashlib, uuid
@@ -30,7 +30,7 @@ from urllib.parse import quote_plus, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# -- Configuration ------------------------------------------------------------
 
 def load_env(path=".env"):
     """Load key=value pairs from .env file if it exists."""
@@ -52,7 +52,7 @@ TWILIO_TOKEN  = os.getenv("TWILIO_TOKEN", "")
 TWILIO_FROM   = os.getenv("TWILIO_FROM", "")   # Your Twilio phone number
 FRANCO_PHONE  = os.getenv("FRANCO_PHONE", "")   # Franco's cell
 
-# ── Search Parameters ────────────────────────────────────────────────────────
+# -- Search Parameters --------------------------------------------------------
 
 VERTICALS = {
     "Restaurants": [
@@ -87,7 +87,7 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# ── Chain / Franchise Blocklist ──────────────────────────────────────────────
+# -- Chain / Franchise Blocklist ----------------------------------------------
 
 CHAIN_KEYWORDS = {
     # Fast food / QSR chains
@@ -152,7 +152,7 @@ def clean_business_name(name):
     )
     return name.strip()
 
-# ── Supabase Helpers ─────────────────────────────────────────────────────────
+# -- Supabase Helpers ---------------------------------------------------------
 
 def sb_headers():
     return {
@@ -184,12 +184,12 @@ def sb_insert_prospects(prospects):
     print(f"  Warning: Supabase insert error {r.status_code}: {r.text[:200]}")
     return 0
 
-# ── Twilio SMS Helper ────────────────────────────────────────────────────────
+# -- Twilio SMS Helper --------------------------------------------------------
 
 def send_sms(body):
     """Send an SMS via Twilio REST API."""
     if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM, FRANCO_PHONE]):
-        print("  Warning: Twilio not configured — skipping SMS")
+        print("  Warning: Twilio not configured -- skipping SMS")
         print(f"  Message would be:\n     {body}")
         return False
     url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json"
@@ -206,9 +206,9 @@ def send_sms(body):
     return False
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # SOURCE 1: YellowPages.ca
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 YP_SEARCH_TERMS = {
     "Restaurants": ["Restaurants", "Cafes", "Bakeries", "Pizza", "Catering"],
@@ -314,9 +314,9 @@ def scrape_yellowpages(search_term, area, max_results=10):
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # SOURCE 2: Google Maps (via maps search results page scraping)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def scrape_google_maps(search_term, area, max_results=10):
     """
@@ -417,9 +417,9 @@ def scrape_google_maps(search_term, area, max_results=10):
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # SOURCE 3: Yelp.ca
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 YELP_SEARCH_TERMS = {
     "Restaurants": ["restaurants", "cafes", "bakeries", "pizza", "catering"],
@@ -525,9 +525,9 @@ def scrape_yelp(search_term, area, max_results=10):
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # SOURCE 4: Bing Places
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def scrape_bing_places(search_term, area, max_results=10):
     """Scrape Bing local search for business listings."""
@@ -596,9 +596,9 @@ def scrape_bing_places(search_term, area, max_results=10):
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # SOURCE 5: BBB (Better Business Bureau)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 BBB_CATEGORIES = {
     "Restaurants": "restaurant",
@@ -674,9 +674,9 @@ def scrape_bbb(search_term, area, max_results=10):
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # SOURCE 6: 411.ca
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def scrape_411ca(search_term, area, max_results=10):
     """Scrape 411.ca Canadian business directory."""
@@ -758,9 +758,9 @@ def scrape_411ca(search_term, area, max_results=10):
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # WEBSITE ENRICHMENT (unchanged from v1.1)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def enrich_from_website(url):
     """
@@ -778,7 +778,7 @@ def enrich_from_website(url):
         text = r.text[:80_000]
         soup = BeautifulSoup(text, "lxml")
 
-        # ── Email ──
+        # -- Email --
         for a in soup.select("a[href^='mailto:']"):
             email = a.get("href", "").replace("mailto:", "").split("?")[0].strip()
             if "@" in email and "example" not in email:
@@ -794,7 +794,7 @@ def enrich_from_website(url):
             if emails:
                 info["email"] = emails[0]
 
-        # ── Phone ──
+        # -- Phone --
         for a in soup.select("a[href^='tel:']"):
             tel = a.get("href", "").replace("tel:", "").strip()
             if len(re.sub(r'\D', '', tel)) >= 10:
@@ -805,7 +805,7 @@ def enrich_from_website(url):
             if phones:
                 info["phone"] = phones[0]
 
-        # ── Owner Name ──
+        # -- Owner Name --
         # Method 1: Meta tags
         for tag in soup.select("meta[name='author'], meta[property='article:author']"):
             content = tag.get("content", "").strip()
@@ -860,7 +860,7 @@ def enrich_from_website(url):
     return info
 
 
-# ── Prospect Builder ─────────────────────────────────────────────────────────
+# -- Prospect Builder ---------------------------------------------------------
 
 def build_prospect(raw, vertical, area):
     """Convert raw scraped data into a CRM prospect record."""
@@ -875,7 +875,7 @@ def build_prospect(raw, vertical, area):
         "phone": raw.get("phone", ""),
         "email": raw.get("email", ""),
         "owner": raw.get("owner", ""),
-        "opp": f"AI automation opportunity — {vertical.lower()} in {area.split(',')[0]}",
+        "opp": f"AI automation opportunity -- {vertical.lower()} in {area.split(',')[0]}",
         "action": "Research & qualify",
         "notes": f"[Auto-sourced {datetime.now().strftime('%Y-%m-%d')} via {source}] {raw.get('snippet', '')[:120]}",
         "last_contact": None,
@@ -886,7 +886,7 @@ def build_prospect(raw, vertical, area):
     }
 
 
-# ── Multi-Source Scraper Dispatcher ──────────────────────────────────────────
+# -- Multi-Source Scraper Dispatcher ------------------------------------------
 
 def scrape_all_sources(search_term, area, max_results=5):
     """
@@ -941,7 +941,7 @@ def scrape_all_sources(search_term, area, max_results=5):
     return all_results
 
 
-# ── Main Agent Logic ─────────────────────────────────────────────────────────
+# -- Main Agent Logic ---------------------------------------------------------
 
 def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
     """
@@ -1057,14 +1057,14 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
 
     # Step 4: Write to Supabase
     if dry_run:
-        print("\n  Dry run —"othing written to database.")
+        print("\n  Dry run -- nothing written to database.")
         with open("leads_preview.json", "w") as f:
             json.dump(all_leads, f, indent=2)
         print("  Preview saved to leads_preview.json")
         return
 
     if not SUPABASE_KEY:
-        print("\n  No SUPABASE_KEY — saving to leads_export.json instead")
+        print("\n  No SUPABASE_KEY -- saving to leads_export.json instead")
         with open("leads_export.json", "w") as f:
             json.dump(all_leads, f, indent=2)
         return
@@ -1100,7 +1100,7 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
     print("\n  Agent run complete.")
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
+# -- CLI ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Caliber Lead Sourcer Agent v2.0")
