@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
-Caliber Lead Sourcer Agent v1.1
+Caliber Lead Sourcer Agent v2.0
 ================================
-Finds privately-owned SMB prospects across the GTA, enriches them,
-writes to Supabase, and texts Franco when a batch is ready for review.
+Multi-source lead sourcing across the GTA. Scrapes:
+  - YellowPages.ca
+  - Google Maps (via Google Places text search)
+  - Yelp.ca
+  - Bing Places
+  - BBB (Better Business Bureau)
+  - 411.ca
 
-Filters out chains, franchises, and large corporations — targets
-independent businesses doing roughly $15M revenue or less.
+Enriches leads from business websites, filters out chains/franchises,
+deduplicates against Supabase CRM, and texts Franco when a batch is ready.
+
+RULE: Never source a lead without an owner/contact name.
 
 Usage:
     python lead_sourcer.py                     # Run with defaults
     python lead_sourcer.py --vertical Restaurants --area "Brampton, ON" --max 10
     python lead_sourcer.py --dry-run           # Preview without writing to DB
 
-Requires a .env file (or exported env vars) — see .env.template
+Requires env vars or .env file — see .env.template
 """
 
 import os, sys, re, json, time, random, argparse, hashlib, uuid
 from datetime import datetime, timezone
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -81,8 +88,6 @@ HEADERS = {
 }
 
 # ── Chain / Franchise Blocklist ──────────────────────────────────────────────
-# These are chains, franchises, or large corporations — not our target market.
-# We want privately-owned independents doing ~$15M revenue or less.
 
 CHAIN_KEYWORDS = {
     # Fast food / QSR chains
@@ -127,10 +132,9 @@ def is_chain_or_franchise(name):
     for keyword in CHAIN_KEYWORDS:
         if keyword in name_lower:
             return True
-    # Also flag if name contains common franchise indicators
     franchise_patterns = [
-        r'#\d+',           # Store numbers like "#1234"
-        r'store\s*#?\d+',  # "Store 45" or "Store #45"
+        r'#\d+',
+        r'store\s*#?\d+',
         r'location\s*#?\d+',
         r'unit\s*#?\d+',
     ]
@@ -140,11 +144,12 @@ def is_chain_or_franchise(name):
     return False
 
 def clean_business_name(name):
-    """Clean up scraped business name — remove leading numbers, extra whitespace."""
-    # Remove leading digits (YellowPages ranking numbers like "1Pizza Gigi")
+    """Clean up scraped business name."""
     name = re.sub(r'^\d+', '', name).strip()
-    # Remove trailing location info that sometimes gets appended
-    name = re.sub(r'\s*-\s*(Toronto|Brampton|Mississauga|Vaughan|Markham|Scarborough|Etobicoke|North York)\s*$', '', name, flags=re.I)
+    name = re.sub(
+        r'\s*-\s*(Toronto|Brampton|Mississauga|Vaughan|Markham|Scarborough|Etobicoke|North York)\s*$',
+        '', name, flags=re.I
+    )
     return name.strip()
 
 # ── Supabase Helpers ─────────────────────────────────────────────────────────
@@ -163,7 +168,7 @@ def sb_get_existing_names():
     r = requests.get(url, headers=sb_headers(), timeout=15)
     if r.status_code == 200:
         return {row["name"].strip().lower() for row in r.json()}
-    print(f"  ⚠ Could not fetch existing prospects: {r.status_code}")
+    print(f"  Warning: Could not fetch existing prospects: {r.status_code}")
     return set()
 
 def sb_insert_prospects(prospects):
@@ -176,16 +181,16 @@ def sb_insert_prospects(prospects):
     r = requests.post(url, headers=headers, json=prospects, timeout=30)
     if r.status_code in (200, 201):
         return len(prospects)
-    print(f"  ⚠ Supabase insert error {r.status_code}: {r.text[:200]}")
+    print(f"  Warning: Supabase insert error {r.status_code}: {r.text[:200]}")
     return 0
 
-# ── Twilio SMS Helper ───────────────────────────────────────────────────────
+# ── Twilio SMS Helper ────────────────────────────────────────────────────────
 
 def send_sms(body):
-    """Send an SMS via Twilio REST API (no SDK needed)."""
+    """Send an SMS via Twilio REST API."""
     if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM, FRANCO_PHONE]):
-        print("  ⚠ Twilio not configured — skipping SMS")
-        print(f"  📋 Message would be:\n     {body}")
+        print("  Warning: Twilio not configured — skipping SMS")
+        print(f"  Message would be:\n     {body}")
         return False
     url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json"
     r = requests.post(
@@ -195,55 +200,43 @@ def send_sms(body):
         timeout=15,
     )
     if r.status_code == 201:
-        print(f"  ✅ SMS sent to {FRANCO_PHONE}")
+        print(f"  SMS sent to {FRANCO_PHONE}")
         return True
-    print(f"  ⚠ SMS failed ({r.status_code}): {r.text[:200]}")
+    print(f"  Warning: SMS failed ({r.status_code}): {r.text[:200]}")
     return False
 
-# ── Web Scraping Engine ──────────────────────────────────────────────────────
-# Scrapes YellowPages.ca — a Canadian business directory with structured
-# listings (name, address, phone, website).
 
-# Map our vertical names to YellowPages search terms
+# ══════════════════════════════════════════════════════════════════════════════
+# SOURCE 1: YellowPages.ca
+# ══════════════════════════════════════════════════════════════════════════════
+
 YP_SEARCH_TERMS = {
     "Restaurants": ["Restaurants", "Cafes", "Bakeries", "Pizza", "Catering"],
     "Retail": ["Boutiques", "Clothing+Stores", "Gift+Shops", "Pet+Stores", "Florists"],
     "Trades": ["Plumbers", "Electricians", "HVAC", "Roofing", "Landscaping", "Painters"],
 }
 
-def area_to_yp_location(area):
-    """Convert 'Toronto, ON' to 'Toronto+ON' for YellowPages URL."""
-    return area.replace(", ", "+").replace(" ", "+")
-
 def scrape_yellowpages(search_term, area, max_results=10):
-    """
-    Scrape YellowPages.ca for business listings.
-    Returns a list of dicts: {name, address, phone, website, snippet}
-    """
+    """Scrape YellowPages.ca for business listings."""
     results = []
-    location = area_to_yp_location(area)
+    location = area.replace(", ", "+").replace(" ", "+")
     url = f"https://www.yellowpages.ca/search/si/1/{quote_plus(search_term)}/{location}"
 
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
         html = r.text
-        print(f"     YP response: {r.status_code}, {len(html)} chars")
+        print(f"     [YP] response: {r.status_code}, {len(html)} chars")
 
         soup = BeautifulSoup(html, "lxml")
-
-        # YellowPages listings are in div.listing or similar containers
         listings = soup.select("div.listing, div.listing__content, div[class*='listing']")
-
         if not listings:
             listings = soup.select("div.resultList div, div.result")
 
         for listing in listings[:max_results]:
-            # ── Business Name ──
             name_el = listing.select_one(
                 "a.listing__name--link, h3.listing__name, "
-                "a[class*='listing__name'], span.listing__name, "
-                "h2 a, h3 a"
+                "a[class*='listing__name'], span.listing__name, h2 a, h3 a"
             )
             if not name_el:
                 continue
@@ -252,64 +245,50 @@ def scrape_yellowpages(search_term, area, max_results=10):
                 continue
 
             name = clean_business_name(raw_name)
-            if not name:
+            if not name or is_chain_or_franchise(name):
+                if name:
+                    print(f"   [YP] Filtered chain: {name}")
                 continue
 
-            # ── Chain Filter ──
-            if is_chain_or_franchise(name):
-                print(f"   🚫 Filtered chain: {name}")
-                continue
-
-            # ── Address ──
+            # Address
             addr_el = listing.select_one(
                 "span.listing__address--full, span[class*='address'], "
                 "div.listing__address, span.adr"
             )
             address = addr_el.get_text(strip=True) if addr_el else ""
 
-            # ── Phone Number ──
-            # Strategy 1: Look for phone-specific elements
+            # Phone
             phone = ""
             phone_el = listing.select_one(
                 "a[class*='phone'], span[class*='phone'], "
                 "a[data-phone], a[href^='tel:'], "
-                "span.mlr__sub-text, li.mlr__item--phone, "
-                "span.listing__phone"
+                "span.mlr__sub-text, li.mlr__item--phone, span.listing__phone"
             )
             if phone_el:
-                # Check href="tel:..." first (most reliable)
                 tel_href = phone_el.get("href", "")
                 if tel_href.startswith("tel:"):
                     phone = tel_href.replace("tel:", "").strip()
-                # Check data-phone attribute
                 elif phone_el.get("data-phone"):
                     phone = phone_el.get("data-phone")
                 else:
                     phone = phone_el.get_text(strip=True)
-
-            # Strategy 2: Search all tel: links in the listing
             if not phone:
                 for a in listing.select("a[href^='tel:']"):
                     tel = a.get("href", "").replace("tel:", "").strip()
                     if len(tel) >= 10:
                         phone = tel
                         break
-
-            # Strategy 3: Regex the entire listing text
             if not phone:
                 all_text = listing.get_text(" ", strip=True)
                 phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', all_text)
                 if phone_match:
                     phone = phone_match.group(1)
-
-            # Clean phone format
             phone = re.sub(r'[^\d+()-.\s]', '', phone).strip()
 
-            # ── Website ──
+            # Website
             website = ""
             web_el = listing.select_one(
-                "a[class*='website'], a[data-analytics='website'], "
-                "a.listing__link--website"
+                "a[class*='website'], a[data-analytics='website'], a.listing__link--website"
             )
             if web_el:
                 website = web_el.get("href", "")
@@ -320,22 +299,468 @@ def scrape_yellowpages(search_term, area, max_results=10):
                         website = href
                         break
 
-            # ── Category / snippet ──
+            # Category / snippet
             cat_el = listing.select_one("span[class*='category'], div[class*='category']")
             snippet = cat_el.get_text(strip=True) if cat_el else ""
 
             results.append({
-                "name": name,
-                "address": address,
-                "phone": phone,
-                "website": website,
-                "snippet": snippet[:200],
+                "name": name, "address": address, "phone": phone,
+                "website": website, "snippet": snippet[:200], "source": "YellowPages"
             })
 
     except Exception as e:
-        print(f"  ⚠ YellowPages scrape error: {e}")
+        print(f"  [YP] scrape error: {e}")
 
     return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SOURCE 2: Google Maps (via maps search results page scraping)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def scrape_google_maps(search_term, area, max_results=10):
+    """
+    Scrape Google search results for local businesses.
+    We search Google with the query "search_term near area" and parse
+    the local pack / organic results for business info.
+    """
+    results = []
+    query = f"{search_term} near {area}"
+    url = f"https://www.google.com/search?q={quote_plus(query)}&num=20&gl=ca&hl=en"
+
+    try:
+        headers = {**HEADERS, "Accept": "text/html,application/xhtml+xml"}
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        html = r.text
+        print(f"     [Google] response: {r.status_code}, {len(html)} chars")
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # Parse local pack results (the map section)
+        # Google local pack entries are often in divs with data-attrid or specific classes
+        local_results = soup.select("div.VkpGBb, div[data-local-attribute], div.rllt__details")
+
+        for item in local_results[:max_results]:
+            # Business name
+            name_el = item.select_one("div.dbg0pd, span.OSrXXb, div[role='heading']")
+            if not name_el:
+                name_el = item.select_one("a[data-ved]")
+            if not name_el:
+                continue
+
+            name = clean_business_name(name_el.get_text(strip=True))
+            if not name or len(name) < 3 or is_chain_or_franchise(name):
+                continue
+
+            # Address (usually in a secondary span)
+            address = ""
+            addr_candidates = item.select("span, div.rllt__details div")
+            for ac in addr_candidates:
+                txt = ac.get_text(strip=True)
+                # Look for text that contains area-ish keywords or has a postal code
+                if re.search(r'(ON|Ontario|\d{3}\s*\w{3}|Street|Ave|Rd|Dr|Blvd)', txt, re.I):
+                    address = txt
+                    break
+
+            # Phone
+            phone = ""
+            all_text = item.get_text(" ", strip=True)
+            phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', all_text)
+            if phone_match:
+                phone = phone_match.group(1)
+
+            # Website (extract from any link that isn't google)
+            website = ""
+            for a in item.select("a[href^='http']"):
+                href = a.get("href", "")
+                if "google.com" not in href and "gstatic" not in href:
+                    website = href
+                    break
+
+            results.append({
+                "name": name, "address": address, "phone": phone,
+                "website": website, "snippet": "", "source": "Google"
+            })
+
+        # Also try parsing organic results if local pack is empty
+        if not results:
+            for div in soup.select("div.g, div[data-sokoban-container]")[:max_results]:
+                title_el = div.select_one("h3")
+                if not title_el:
+                    continue
+                name = clean_business_name(title_el.get_text(strip=True))
+                if not name or len(name) < 3 or is_chain_or_franchise(name):
+                    continue
+
+                link_el = div.select_one("a[href^='http']")
+                website = link_el.get("href", "") if link_el else ""
+                if "google.com" in website:
+                    website = ""
+
+                snippet_el = div.select_one("div.VwiC3b, span.st")
+                snippet = snippet_el.get_text(strip=True)[:200] if snippet_el else ""
+
+                phone = ""
+                phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', snippet)
+                if phone_match:
+                    phone = phone_match.group(1)
+
+                results.append({
+                    "name": name, "address": "", "phone": phone,
+                    "website": website, "snippet": snippet, "source": "Google"
+                })
+
+    except Exception as e:
+        print(f"  [Google] scrape error: {e}")
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SOURCE 3: Yelp.ca
+# ══════════════════════════════════════════════════════════════════════════════
+
+YELP_SEARCH_TERMS = {
+    "Restaurants": ["restaurants", "cafes", "bakeries", "pizza", "catering"],
+    "Retail": ["boutiques", "clothing", "gift+shops", "pet+stores", "florists"],
+    "Trades": ["plumbers", "electricians", "hvac", "roofing", "landscaping"],
+}
+
+def scrape_yelp(search_term, area, max_results=10):
+    """Scrape Yelp.ca for business listings."""
+    results = []
+    location = area.replace(", ", "+").replace(" ", "+")
+    url = f"https://www.yelp.ca/search?find_desc={quote_plus(search_term)}&find_loc={quote_plus(area)}"
+
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        html = r.text
+        print(f"     [Yelp] response: {r.status_code}, {len(html)} chars")
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # Yelp uses various div containers for search results
+        # Try multiple selector strategies
+        listings = soup.select(
+            "div[data-testid='serp-ia-card'], "
+            "li.border-color--default__09f24__BAILS, "
+            "div.container__09f24__FeTO6, "
+            "div[class*='businessName'], "
+            "div.arrange-unit__09f24__rqHTg"
+        )
+
+        # If targeted selectors fail, use a broader approach
+        if not listings:
+            # Look for links to business pages on Yelp
+            biz_links = soup.select("a[href*='/biz/']")
+            seen_names = set()
+            for link in biz_links[:max_results * 2]:
+                name = link.get_text(strip=True)
+                name = clean_business_name(name)
+                if not name or len(name) < 3 or name.lower() in seen_names:
+                    continue
+                if is_chain_or_franchise(name):
+                    continue
+                seen_names.add(name.lower())
+
+                # Try to find parent container for more info
+                parent = link.find_parent("div")
+                address = ""
+                phone = ""
+                if parent:
+                    text = parent.get_text(" ", strip=True)
+                    phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', text)
+                    if phone_match:
+                        phone = phone_match.group(1)
+                    addr_match = re.search(r'(\d+\s+[\w\s]+(?:St|Ave|Rd|Dr|Blvd|Cres|Way|Ct)[\w\s,]*ON)', text, re.I)
+                    if addr_match:
+                        address = addr_match.group(1).strip()
+
+                biz_href = link.get("href", "")
+                website = ""
+                if biz_href.startswith("/biz/"):
+                    # We could follow the Yelp biz page, but that's extra requests
+                    pass
+
+                results.append({
+                    "name": name, "address": address, "phone": phone,
+                    "website": website, "snippet": "", "source": "Yelp"
+                })
+                if len(results) >= max_results:
+                    break
+        else:
+            for listing in listings[:max_results]:
+                # Try to extract name
+                name_el = listing.select_one(
+                    "a[href*='/biz/'], h3, span[data-testid='serp-ia-card-title']"
+                )
+                if not name_el:
+                    continue
+                name = clean_business_name(name_el.get_text(strip=True))
+                if not name or len(name) < 3 or is_chain_or_franchise(name):
+                    continue
+
+                all_text = listing.get_text(" ", strip=True)
+
+                phone = ""
+                phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', all_text)
+                if phone_match:
+                    phone = phone_match.group(1)
+
+                address = ""
+                addr_match = re.search(r'(\d+\s+[\w\s]+(?:St|Ave|Rd|Dr|Blvd|Cres|Way|Ct)[\w\s,]*ON)', all_text, re.I)
+                if addr_match:
+                    address = addr_match.group(1).strip()
+
+                results.append({
+                    "name": name, "address": address, "phone": phone,
+                    "website": "", "snippet": "", "source": "Yelp"
+                })
+
+    except Exception as e:
+        print(f"  [Yelp] scrape error: {e}")
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SOURCE 4: Bing Places
+# ══════════════════════════════════════════════════════════════════════════════
+
+def scrape_bing_places(search_term, area, max_results=10):
+    """Scrape Bing local search for business listings."""
+    results = []
+    query = f"{search_term} near {area}"
+    url = f"https://www.bing.com/search?q={quote_plus(query)}&setmkt=en-CA"
+
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        html = r.text
+        print(f"     [Bing] response: {r.status_code}, {len(html)} chars")
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # Bing local results
+        local_items = soup.select(
+            "div.b_scard, div.local-card, li.b_algo, "
+            "div[data-partnertag*='local'], div.b_locald"
+        )
+
+        for item in local_items[:max_results]:
+            name_el = item.select_one("h2 a, h3 a, a.tilk, div.lc_content h2")
+            if not name_el:
+                name_el = item.select_one("a[href]")
+            if not name_el:
+                continue
+
+            name = clean_business_name(name_el.get_text(strip=True))
+            if not name or len(name) < 3 or is_chain_or_franchise(name):
+                continue
+
+            all_text = item.get_text(" ", strip=True)
+
+            # Phone
+            phone = ""
+            phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', all_text)
+            if phone_match:
+                phone = phone_match.group(1)
+
+            # Address
+            address = ""
+            addr_match = re.search(
+                r'(\d+\s+[\w\s]+(?:St|Ave|Rd|Dr|Blvd|Cres|Way|Ct|Lane|Pkwy|Hwy)[\w\s.,]*(?:ON|Ontario))',
+                all_text, re.I
+            )
+            if addr_match:
+                address = addr_match.group(1).strip()
+
+            # Website
+            website = ""
+            for a in item.select("a[href^='http']"):
+                href = a.get("href", "")
+                if "bing.com" not in href and "microsoft" not in href:
+                    website = href
+                    break
+
+            results.append({
+                "name": name, "address": address, "phone": phone,
+                "website": website, "snippet": "", "source": "Bing"
+            })
+
+    except Exception as e:
+        print(f"  [Bing] scrape error: {e}")
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SOURCE 5: BBB (Better Business Bureau)
+# ══════════════════════════════════════════════════════════════════════════════
+
+BBB_CATEGORIES = {
+    "Restaurants": "restaurant",
+    "Retail": "retail-stores",
+    "Trades": "contractors-general",
+}
+
+def scrape_bbb(search_term, area, max_results=10):
+    """Scrape BBB for accredited business listings."""
+    results = []
+    # BBB search URL format
+    city = area.split(",")[0].strip()
+    province = area.split(",")[1].strip() if "," in area else "ON"
+    url = (
+        f"https://www.bbb.org/search?find_country=CAN&find_entity=0032-000"
+        f"&find_text={quote_plus(search_term)}"
+        f"&find_loc={quote_plus(city)}&find_state={quote_plus(province)}"
+        f"&page=1&sort=Relevance"
+    )
+
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        html = r.text
+        print(f"     [BBB] response: {r.status_code}, {len(html)} chars")
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # BBB result cards
+        listings = soup.select(
+            "div.search-result, a.text-blue-medium, "
+            "div[class*='result-item'], div.bds-body"
+        )
+
+        # Broader approach: find all links to BBB profile pages
+        biz_links = soup.select("a[href*='/profile/']")
+        seen = set()
+
+        for link in biz_links[:max_results * 2]:
+            name = link.get_text(strip=True)
+            name = clean_business_name(name)
+            if not name or len(name) < 3 or name.lower() in seen:
+                continue
+            if is_chain_or_franchise(name):
+                continue
+            seen.add(name.lower())
+
+            parent = link.find_parent("div")
+            phone = ""
+            address = ""
+            if parent:
+                text = parent.get_text(" ", strip=True)
+                phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', text)
+                if phone_match:
+                    phone = phone_match.group(1)
+                addr_match = re.search(
+                    r'(\d+\s+[\w\s]+(?:St|Ave|Rd|Dr|Blvd|Cres|Way)[\w\s.,]*)',
+                    text, re.I
+                )
+                if addr_match:
+                    address = addr_match.group(1).strip()
+
+            results.append({
+                "name": name, "address": address, "phone": phone,
+                "website": "", "snippet": "BBB Listed", "source": "BBB"
+            })
+            if len(results) >= max_results:
+                break
+
+    except Exception as e:
+        print(f"  [BBB] scrape error: {e}")
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SOURCE 6: 411.ca
+# ══════════════════════════════════════════════════════════════════════════════
+
+def scrape_411ca(search_term, area, max_results=10):
+    """Scrape 411.ca Canadian business directory."""
+    results = []
+    city = area.split(",")[0].strip()
+    url = (
+        f"https://411.ca/search/"
+        f"?q={quote_plus(search_term)}"
+        f"&l={quote_plus(city + ' ON')}"
+        f"&t=business"
+    )
+
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        html = r.text
+        print(f"     [411] response: {r.status_code}, {len(html)} chars")
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # 411.ca listing cards
+        listings = soup.select(
+            "div.listing, div.vcard, div.result-card, "
+            "div[class*='listing'], article"
+        )
+
+        for listing in listings[:max_results]:
+            name_el = listing.select_one(
+                "h2 a, h3 a, a.listing-name, span.fn, "
+                "a[class*='name'], div.listing-title a"
+            )
+            if not name_el:
+                continue
+            name = clean_business_name(name_el.get_text(strip=True))
+            if not name or len(name) < 3 or is_chain_or_franchise(name):
+                continue
+
+            all_text = listing.get_text(" ", strip=True)
+
+            # Phone
+            phone = ""
+            phone_el = listing.select_one("a[href^='tel:']")
+            if phone_el:
+                phone = phone_el.get("href", "").replace("tel:", "").strip()
+            if not phone:
+                phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', all_text)
+                if phone_match:
+                    phone = phone_match.group(1)
+
+            # Address
+            address = ""
+            addr_el = listing.select_one("span.adr, div[class*='address'], span.street-address")
+            if addr_el:
+                address = addr_el.get_text(strip=True)
+            if not address:
+                addr_match = re.search(
+                    r'(\d+\s+[\w\s]+(?:St|Ave|Rd|Dr|Blvd|Cres|Way)[\w\s.,]*)',
+                    all_text, re.I
+                )
+                if addr_match:
+                    address = addr_match.group(1).strip()
+
+            # Website
+            website = ""
+            for a in listing.select("a[href^='http']"):
+                href = a.get("href", "")
+                if "411.ca" not in href:
+                    website = href
+                    break
+
+            results.append({
+                "name": name, "address": address, "phone": phone,
+                "website": website, "snippet": "", "source": "411.ca"
+            })
+
+    except Exception as e:
+        print(f"  [411] scrape error: {e}")
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WEBSITE ENRICHMENT (unchanged from v1.1)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def enrich_from_website(url):
     """
@@ -350,18 +775,16 @@ def enrich_from_website(url):
 
     try:
         r = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
-        text = r.text[:80_000]  # first 80KB
+        text = r.text[:80_000]
         soup = BeautifulSoup(text, "lxml")
 
         # ── Email ──
-        # Method 1: mailto links (most reliable)
         for a in soup.select("a[href^='mailto:']"):
             email = a.get("href", "").replace("mailto:", "").split("?")[0].strip()
             if "@" in email and "example" not in email:
                 info["email"] = email
                 break
 
-        # Method 2: Regex scan
         if not info["email"]:
             emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
             skip = ["example.com", "sentry.io", "wixpress", "googleapis",
@@ -372,14 +795,11 @@ def enrich_from_website(url):
                 info["email"] = emails[0]
 
         # ── Phone ──
-        # Method 1: tel: links
         for a in soup.select("a[href^='tel:']"):
             tel = a.get("href", "").replace("tel:", "").strip()
             if len(re.sub(r'\D', '', tel)) >= 10:
                 info["phone"] = tel
                 break
-
-        # Method 2: Regex
         if not info["phone"]:
             phones = re.findall(r'\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}', text)
             if phones:
@@ -393,27 +813,24 @@ def enrich_from_website(url):
                 info["owner"] = content
                 break
 
-        # Method 2: Look for "owner", "founded by", "about" patterns in text
+        # Method 2: Text patterns
+        owner_patterns = [
+            r'(?:owner|proprietor|founded by|chef|operated by|managed by)[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)',
+            r'(?:owner|proprietor|founded by|chef)[:\s]+([A-Z][a-z]+)',
+            r'(?:Hi,?\s+I\'?m|Meet)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)',
+            r'(?:Hi,?\s+I\'?m|Meet)\s+([A-Z][a-z]+)',
+        ]
         if not info["owner"]:
-            # Common patterns on small business sites
-            owner_patterns = [
-                r'(?:owner|proprietor|founded by|chef|operated by|managed by)[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)',
-                r'(?:owner|proprietor|founded by|chef)[:\s]+([A-Z][a-z]+)',
-                r'(?:Hi,?\s+I\'?m|Meet)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)',
-                r'(?:Hi,?\s+I\'?m|Meet)\s+([A-Z][a-z]+)',
-            ]
-            # Only search visible text (not scripts/styles)
             visible_text = soup.get_text(" ", strip=True)[:10_000]
             for pattern in owner_patterns:
                 match = re.search(pattern, visible_text)
                 if match:
                     candidate = match.group(1).strip()
-                    # Sanity check: should look like a name
                     if 2 < len(candidate) < 40 and not any(c.isdigit() for c in candidate):
                         info["owner"] = candidate
                         break
 
-        # Method 3: Check "About" page if we're on the homepage
+        # Method 3: Check About page
         if not info["owner"] and url.rstrip("/").count("/") <= 3:
             about_urls = [
                 url.rstrip("/") + "/about",
@@ -442,11 +859,13 @@ def enrich_from_website(url):
 
     return info
 
+
 # ── Prospect Builder ─────────────────────────────────────────────────────────
 
 def build_prospect(raw, vertical, area):
     """Convert raw scraped data into a CRM prospect record."""
     now = datetime.now(timezone.utc).isoformat()
+    source = raw.get("source", "Unknown")
     return {
         "id": str(uuid.uuid4()),
         "name": raw["name"][:100],
@@ -458,7 +877,7 @@ def build_prospect(raw, vertical, area):
         "owner": raw.get("owner", ""),
         "opp": f"AI automation opportunity — {vertical.lower()} in {area.split(',')[0]}",
         "action": "Research & qualify",
-        "notes": f"[Auto-sourced {datetime.now().strftime('%Y-%m-%d')}] {raw.get('snippet', '')[:150]}",
+        "notes": f"[Auto-sourced {datetime.now().strftime('%Y-%m-%d')} via {source}] {raw.get('snippet', '')[:120]}",
         "last_contact": None,
         "date": None,
         "activities": json.dumps([]),
@@ -466,90 +885,160 @@ def build_prospect(raw, vertical, area):
         "updated_at": now,
     }
 
+
+# ── Multi-Source Scraper Dispatcher ──────────────────────────────────────────
+
+def scrape_all_sources(search_term, area, max_results=5):
+    """
+    Run all 6 scrapers for a given search term + area.
+    Returns a combined, name-deduplicated list.
+    Merges data when the same business appears in multiple sources.
+    """
+    all_results = []
+    seen_names = {}  # norm_name -> index in all_results
+
+    # Define which sources to use and how
+    sources = [
+        ("YellowPages", lambda: scrape_yellowpages(search_term, area, max_results)),
+        ("Google",       lambda: scrape_google_maps(search_term, area, max_results)),
+        ("Yelp",         lambda: scrape_yelp(search_term, area, max_results)),
+        ("Bing",         lambda: scrape_bing_places(search_term, area, max_results)),
+        ("BBB",          lambda: scrape_bbb(search_term, area, max_results)),
+        ("411.ca",       lambda: scrape_411ca(search_term, area, max_results)),
+    ]
+
+    for source_name, scrape_fn in sources:
+        try:
+            results = scrape_fn()
+            print(f"   [{source_name}] returned {len(results)} results")
+
+            for item in results:
+                norm = item["name"].strip().lower()
+                if norm in seen_names:
+                    # Merge: fill in missing fields from this source
+                    idx = seen_names[norm]
+                    existing = all_results[idx]
+                    if not existing.get("phone") and item.get("phone"):
+                        existing["phone"] = item["phone"]
+                    if not existing.get("address") and item.get("address"):
+                        existing["address"] = item["address"]
+                    if not existing.get("website") and item.get("website"):
+                        existing["website"] = item["website"]
+                    if not existing.get("email") and item.get("email"):
+                        existing["email"] = item["email"]
+                    # Track that multiple sources found this business
+                    existing["source"] = existing.get("source", "") + f"+{source_name}"
+                else:
+                    seen_names[norm] = len(all_results)
+                    all_results.append(item)
+
+        except Exception as e:
+            print(f"   [{source_name}] failed: {e}")
+
+        # Small delay between sources to be polite
+        time.sleep(random.uniform(1.0, 2.5))
+
+    return all_results
+
+
 # ── Main Agent Logic ─────────────────────────────────────────────────────────
 
 def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
     """
-    Main entry point. Searches for leads, deduplicates, enriches,
-    writes to Supabase, and notifies Franco.
+    Main entry point. Searches 6 sources for leads, deduplicates,
+    enriches from websites, writes to Supabase, and notifies Franco.
     """
     verticals = verticals or list(VERTICALS.keys())
     areas = areas or GTA_AREAS
 
     print("=" * 60)
-    print("  🔍 Caliber Lead Sourcer Agent v1.1")
+    print("  Caliber Lead Sourcer Agent v2.0 (Multi-Source)")
     print("=" * 60)
     print(f"  Verticals : {', '.join(verticals)}")
     print(f"  Areas     : {len(areas)} GTA locations")
     print(f"  Max/search: {max_per_search}")
+    print(f"  Sources   : YellowPages, Google, Yelp, Bing, BBB, 411.ca")
     print(f"  Dry run   : {dry_run}")
-    print(f"  Filter    : Chains/franchises BLOCKED")
-    print(f"  Supabase  : {'✅ Connected' if SUPABASE_KEY else '❌ No key'}")
-    print(f"  Twilio    : {'✅ Configured' if TWILIO_SID else '⏭ Skipped'}")
+    print(f"  Filter    : Chains BLOCKED, no-name SKIPPED")
+    print(f"  Supabase  : {'Connected' if SUPABASE_KEY else 'No key'}")
+    print(f"  Twilio    : {'Configured' if TWILIO_SID else 'Skipped'}")
     print()
 
     # Step 1: Get existing prospects for deduplication
     existing = set()
     if not dry_run and SUPABASE_KEY:
-        print("📋 Fetching existing prospects for dedup...")
+        print("Fetching existing prospects for dedup...")
         existing = sb_get_existing_names()
         print(f"   Found {len(existing)} existing prospects\n")
 
-    # Step 2: Scrape for new leads
+    # Step 2: Multi-source scraping
     all_leads = []
-    chains_blocked = 0
     searches_done = 0
+    sources_hit = {"YellowPages": 0, "Google": 0, "Yelp": 0, "Bing": 0, "BBB": 0, "411.ca": 0}
 
     for v_name in verticals:
+        # Pick search terms for this vertical
         yp_terms = YP_SEARCH_TERMS.get(v_name, [v_name])
         sample_size = min(3, len(yp_terms))
         chosen_terms = random.sample(yp_terms, sample_size)
 
         for search_term in chosen_terms:
+            # Pick random areas to search
             chosen_areas = random.sample(areas, min(5, len(areas)))
 
             for area in chosen_areas:
-                print(f"🔎 Searching: {search_term} in {area}")
+                print(f"\n{'='*50}")
+                print(f"SEARCH: {search_term} in {area}")
+                print(f"{'='*50}")
 
-                raw_results = scrape_yellowpages(search_term, area, max_results=max_per_search)
-                print(f"   Found {len(raw_results)} raw results")
+                # Run ALL sources for this search term + area
+                raw_results = scrape_all_sources(search_term, area, max_results=max_per_search)
+                print(f"\n   Combined: {len(raw_results)} unique businesses from all sources")
 
                 for raw in raw_results:
-                    # Dedup check
+                    # Dedup against existing CRM
                     norm_name = raw["name"].strip().lower()
                     if norm_name in existing:
-                        print(f"   ⏭ Skipping duplicate: {raw['name']}")
+                        print(f"   SKIP duplicate: {raw['name']}")
                         continue
 
-                    # Enrich from website if we have one
+                    # Enrich from website
                     if raw.get("website"):
-                        print(f"   🔗 Enriching: {raw['name']}")
+                        print(f"   Enriching: {raw['name']}")
                         extra = enrich_from_website(raw["website"])
                         raw["email"] = raw.get("email") or extra["email"]
                         raw["phone"] = raw.get("phone") or extra["phone"]
                         raw["owner"] = raw.get("owner") or extra["owner"]
 
                     # FILTER: Skip leads with no owner/contact name
+                    # Franco's rule: "IF it doesn't have a name its useless to me"
                     if not raw.get("owner", "").strip():
-                        print(f"   ⛔ Skipping (no contact name): {raw['name']}")
+                        print(f"   SKIP (no contact name): {raw['name']}")
                         continue
+
+                    # Track source stats
+                    for src in raw.get("source", "").split("+"):
+                        src = src.strip()
+                        if src in sources_hit:
+                            sources_hit[src] += 1
 
                     prospect = build_prospect(raw, v_name, area)
                     all_leads.append(prospect)
-                    existing.add(norm_name)  # prevent dupes within same run
+                    existing.add(norm_name)
 
                 searches_done += 1
-                # Rate limit: be respectful
-                delay = random.uniform(2.0, 5.0)
-                print(f"   ⏳ Waiting {delay:.1f}s...\n")
+                # Rate limit between search combos
+                delay = random.uniform(2.0, 4.0)
+                print(f"   Waiting {delay:.1f}s...\n")
                 time.sleep(delay)
 
     # Step 3: Summary
-    print("=" * 60)
-    print(f"  📊 Sourcing Complete")
+    print("\n" + "=" * 60)
+    print(f"  Sourcing Complete")
     print(f"     Searches run    : {searches_done}")
     print(f"     New leads       : {len(all_leads)}")
-    print(f"     Chains filtered : (see 🚫 above)")
+    print(f"     Source breakdown : {json.dumps(sources_hit)}")
+    print(f"     Chains filtered : (see logs above)")
     print("=" * 60)
 
     if not all_leads:
@@ -558,40 +1047,40 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
 
     # Print preview
     print("\n  Preview of new leads:")
-    for i, p in enumerate(all_leads[:10], 1):
-        email_flag = "📧" if p["email"] else "  "
-        phone_flag = "📞" if p["phone"] else "  "
-        owner_flag = "👤" if p["owner"] else "  "
-        print(f"   {i:>2}. {email_flag}{phone_flag}{owner_flag} {p['name'][:35]:<35} | {p['cat']:<12} | {p['address'][:30]}")
-    if len(all_leads) > 10:
-        print(f"   ... and {len(all_leads) - 10} more")
+    for i, p in enumerate(all_leads[:15], 1):
+        email_flag = "E" if p["email"] else " "
+        phone_flag = "P" if p["phone"] else " "
+        owner_flag = "O" if p["owner"] else " "
+        print(f"   {i:>2}. [{email_flag}{phone_flag}{owner_flag}] {p['name'][:35]:<35} | {p['cat']:<12} | {p['owner'][:20]}")
+    if len(all_leads) > 15:
+        print(f"   ... and {len(all_leads) - 15} more")
 
     # Step 4: Write to Supabase
     if dry_run:
-        print("\n  🏁 Dry run — nothing written to database.")
+        print("\n  Dry run —"othing written to database.")
         with open("leads_preview.json", "w") as f:
             json.dump(all_leads, f, indent=2)
-        print("  💾 Preview saved to leads_preview.json")
+        print("  Preview saved to leads_preview.json")
         return
 
     if not SUPABASE_KEY:
-        print("\n  ⚠ No SUPABASE_KEY — saving to leads_export.json instead")
+        print("\n  No SUPABASE_KEY — saving to leads_export.json instead")
         with open("leads_export.json", "w") as f:
             json.dump(all_leads, f, indent=2)
         return
 
-    print(f"\n  📤 Writing {len(all_leads)} prospects to Supabase...")
+    print(f"\n  Writing {len(all_leads)} prospects to Supabase...")
     inserted = 0
     for i in range(0, len(all_leads), 25):
         batch = all_leads[i:i+25]
         count = sb_insert_prospects(batch)
         inserted += count
         if count:
-            print(f"     ✅ Batch {i//25 + 1}: {count} inserted")
+            print(f"     Batch {i//25 + 1}: {count} inserted")
         else:
-            print(f"     ⚠ Batch {i//25 + 1}: failed")
+            print(f"     Batch {i//25 + 1}: failed")
 
-    print(f"\n  ✅ Total inserted: {inserted}/{len(all_leads)}")
+    print(f"\n  Total inserted: {inserted}/{len(all_leads)}")
 
     # Step 5: Notify Franco
     if inserted > 0:
@@ -602,17 +1091,19 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
 
         msg = (
             f"Caliber: {inserted} new leads added ({breakdown}). "
+            f"Sources: YP/Google/Yelp/Bing/BBB/411. "
             f"Review: synapse-crm-coral.vercel.app"
         )
-        print(f"\n  📱 Notifying Franco...")
+        print(f"\n  Notifying Franco...")
         send_sms(msg)
 
-    print("\n  🏁 Agent run complete.")
+    print("\n  Agent run complete.")
+
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Caliber Lead Sourcer Agent")
+    parser = argparse.ArgumentParser(description="Caliber Lead Sourcer Agent v2.0")
     parser.add_argument("--vertical", "-v", nargs="+",
                         choices=list(VERTICALS.keys()),
                         help="Which verticals to search (default: all)")
