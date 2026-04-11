@@ -317,22 +317,68 @@ def send_email_via_resend(to_email, to_name, subject, body_html, body_text):
 # ENRICHMENT: Find owner names via Google search of LinkedIn + Facebook
 # ==============================================================================
 
-def enrich_owner_name(business_name, city):
+def enrich_prospect(business_name, city):
     """
-    Cross-reference LinkedIn and Facebook via Google search to find
-    owner/manager names for a business.
-    Returns (name, source) tuple or ("", "").
+    Full enrichment: find owner name + Google review data.
+    Returns dict: {owner: "", source: "", stars: 0, review_count: 0}
     """
-    # Try LinkedIn first, then Facebook
+    result = {"owner": "", "source": "", "stars": 0, "review_count": 0}
+
+    # Get Google reviews/stars
+    stars, count = _scrape_google_reviews(business_name, city)
+    result["stars"] = stars
+    result["review_count"] = count
+
+    # Try LinkedIn first, then Facebook for owner name
     name = _search_linkedin(business_name, city)
     if name:
-        return name, "LinkedIn"
+        result["owner"] = name
+        result["source"] = "LinkedIn"
+        return result
 
     name = _search_facebook(business_name, city)
     if name:
-        return name, "Facebook"
+        result["owner"] = name
+        result["source"] = "Facebook"
+        return result
 
-    return "", ""
+    return result
+
+
+def _scrape_google_reviews(business_name, city):
+    """
+    Search Google for business and extract star rating + review count.
+    Returns (stars: float, review_count: int) or (0, 0).
+    """
+    try:
+        query = f"{business_name} {city} reviews"
+        url = f"https://www.google.com/search?q={quote_plus(query)}&gl=ca&hl=en"
+        r = requests.get(url, headers=HEADERS, timeout=10)
+
+        if r.status_code != 200:
+            return 0, 0
+
+        text = r.text
+
+        # Pattern 1: "4.5 stars" or "4.5/5" followed by review count
+        star_match = re.search(r'(\d+\.?\d*)\s*(?:stars?|/\s*5)', text, re.I)
+        count_match = re.search(r'(\d[\d,]*)\s*(?:reviews?|ratings?|Google reviews?)', text, re.I)
+
+        stars = float(star_match.group(1)) if star_match else 0
+        count = int(count_match.group(1).replace(",", "")) if count_match else 0
+
+        # Validate stars range
+        if stars > 5:
+            stars = 0
+        if stars > 0:
+            print(f"     [Reviews] {stars} stars, {count} reviews")
+
+        time.sleep(random.uniform(1, 2))
+        return stars, count
+
+    except Exception as e:
+        print(f"     [Reviews] Error: {e}")
+        return 0, 0
 
 
 def _search_linkedin(business_name, city):
@@ -490,6 +536,30 @@ EMAIL_TEMPLATES = {
 }
 
 
+def _generate_compliment(business_name, city, notes):
+    """Generate a personalized compliment based on Google review data."""
+    stars = 0
+    count = 0
+
+    # Parse review data from notes field
+    if notes:
+        star_match = re.search(r'(\d+\.?\d*)\s*stars?,\s*(\d+)\s*reviews?', notes)
+        if star_match:
+            stars = float(star_match.group(1))
+            count = int(star_match.group(2))
+
+    if stars >= 4.5 and count >= 50:
+        return f"I came across {business_name} in {city} — {stars} stars across {count} reviews is no joke. That kind of reputation takes real work to build."
+    elif stars >= 4.5 and count > 0:
+        return f"I came across {business_name} in {city} — {stars} stars says a lot about how you run things. Your customers clearly trust what you've built."
+    elif stars >= 4.0 and count > 0:
+        return f"I came across {business_name} in {city} — your reviews speak for themselves. You can tell there's a real standard behind how you operate."
+    elif stars > 0 and count > 0:
+        return f"I came across {business_name} in {city} — it's clear you've put a lot into building something real. That stood out to me."
+    else:
+        return f"I came across {business_name} in {city} — really like what you've built. You can tell a lot of thought goes into how you run things."
+
+
 def generate_email(prospect):
     """
     Generate a personalized cold email for a prospect.
@@ -504,6 +574,7 @@ def generate_email(prospect):
     vertical = prospect.get("cat", "")
     ai_gap = prospect.get("opp", "")
     address = prospect.get("address", "")
+    notes = prospect.get("notes", "")
 
     # Extract city
     city = "the GTA"
@@ -514,24 +585,34 @@ def generate_email(prospect):
         elif parts:
             city = parts[0].strip()
 
-    template = EMAIL_TEMPLATES.get(vertical, {
-        "angle": "AI automation tailored to your business",
-        "save": "hours on manual work each week",
-        "pain": "repetitive tasks that take up your day",
-    })
+    # Rotating subject lines (randomized per email)
+    subject_templates = [
+        f"{first_name}",
+        f"idea for {business_name}",
+        f"{first_name}, quick thought",
+    ]
+    subject = random.choice(subject_templates)
 
-    subject = f"Quick question about {business_name}"
+    # Personalized compliment based on Google reviews
+    compliment = _generate_compliment(business_name, city, notes)
 
     body_text = (
         f"Hi {first_name},\n\n"
-        f"I came across {business_name} in {city} and had a quick question.\n\n"
-        f"I know a lot of {vertical.lower()} businesses deal with {template['pain']}. "
-        f"We've been helping local businesses in the GTA set up {template['angle']} "
-        f"- stuff that saves {template['save']} without changing how you already operate.\n\n"
-        f"Would you be open to a quick 15-minute call this week to see if it's a fit?\n\n"
-        f"Best,\n"
+        f"{compliment}\n\n"
+        f"That's actually why I wanted to reach out. We work with "
+        f"{vertical.lower()} businesses across the GTA and what we do is "
+        f"pretty straightforward — we take a close look at how things "
+        f"run day to day, find the gaps that are quietly eating into "
+        f"your time or your margins, and bridge them. Most owners we "
+        f"sit down with are surprised by how much room there is to "
+        f"tighten things up and drive better profits.\n\n"
+        f"We're happy to take a look at no cost. If we find something "
+        f"worth addressing, we'll walk you through it. If not, you "
+        f"walk away knowing exactly where you stand.\n\n"
+        f"Open to a quick chat? Reply here or text me anytime at "
+        f"(647) 210-3737.\n\n"
         f"Franco Di Giovanni\n"
-        f"Unify AI Partners - AI Automation for Local Businesses\n"
+        f"Unify AI Partners\n"
         f"franco@unifyaipartners.ca\n\n"
         f"---\n"
         f"If you'd prefer not to hear from us, just reply with 'unsubscribe'."
@@ -539,14 +620,21 @@ def generate_email(prospect):
 
     body_html = (
         f"<p>Hi {first_name},</p>"
-        f"<p>I came across <strong>{business_name}</strong> in {city} and had a quick question.</p>"
-        f"<p>I know a lot of {vertical.lower()} businesses deal with {template['pain']}. "
-        f"We've been helping local businesses in the GTA set up {template['angle']} "
-        f"&mdash; stuff that saves {template['save']} without changing how you already operate.</p>"
-        f"<p>Would you be open to a quick 15-minute call this week to see if it's a fit?</p>"
-        f"<p>Best,<br>"
-        f"Franco Di Giovanni<br>"
-        f"<strong>Unify AI Partners</strong> &mdash; AI Automation for Local Businesses<br>"
+        f"<p>{compliment}</p>"
+        f"<p>That's actually why I wanted to reach out. We work with "
+        f"{vertical.lower()} businesses across the GTA and what we do is "
+        f"pretty straightforward &mdash; we take a close look at how things "
+        f"run day to day, find the gaps that are quietly eating into "
+        f"your time or your margins, and bridge them. Most owners we "
+        f"sit down with are surprised by how much room there is to "
+        f"tighten things up and drive better profits.</p>"
+        f"<p>We're happy to take a look at no cost. If we find something "
+        f"worth addressing, we'll walk you through it. If not, you "
+        f"walk away knowing exactly where you stand.</p>"
+        f"<p>Open to a quick chat? Reply here or text me anytime at "
+        f"(647) 210-3737.</p>"
+        f"<p>Franco Di Giovanni<br>"
+        f"<strong>Unify AI Partners</strong><br>"
         f"<a href='mailto:franco@unifyaipartners.ca'>franco@unifyaipartners.ca</a></p>"
         f"<hr style='border:none;border-top:1px solid #ddd;margin-top:20px'>"
         f"<p style='font-size:11px;color:#999'>If you'd prefer not to hear from us, "
@@ -626,19 +714,27 @@ def run_draft(max_drafts=20, dry_run=False):
                 city = parts[0].strip()
 
         print(f"\n  Enriching: {name} ({city})")
-        owner_name, source = enrich_owner_name(name, city)
+        enrichment = enrich_prospect(name, city)
 
-        if owner_name:
+        # Store review data regardless of owner name result
+        if enrichment["stars"] > 0 and not dry_run:
+            notes = prospect.get("notes", "") or ""
+            review_note = f" | {enrichment['stars']} stars, {enrichment['review_count']} reviews"
+            if review_note not in notes:
+                url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
+                requests.patch(url, headers=sb_headers(),
+                    json={"notes": notes + review_note}, timeout=15)
+
+        if enrichment["owner"]:
             enriched_count += 1
-            if source == "LinkedIn":
+            if enrichment["source"] == "LinkedIn":
                 enriched_linkedin += 1
             else:
                 enriched_facebook += 1
 
-            print(f"    Found: {owner_name} via {source}")
+            print(f"    Found: {enrichment['owner']} via {enrichment['source']}")
             if not dry_run:
-                update_prospect_owner(pid, owner_name)
-                # Also update the action field
+                update_prospect_owner(pid, enrichment["owner"])
                 url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
                 requests.patch(url, headers=sb_headers(),
                     json={"action": "Ready for cold email"}, timeout=15)
