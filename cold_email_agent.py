@@ -549,15 +549,15 @@ def _generate_compliment(business_name, city, notes):
             count = int(star_match.group(2))
 
     if stars >= 4.5 and count >= 50:
-        return f"I came across {business_name} in {city} — {stars} stars across {count} reviews is no joke. That kind of reputation takes real work to build."
+        return f"I came across {business_name} in {city} — {stars} stars across {count} reviews is no joke."
     elif stars >= 4.5 and count > 0:
-        return f"I came across {business_name} in {city} — {stars} stars says a lot about how you run things. Your customers clearly trust what you've built."
+        return f"I came across {business_name} in {city} — {stars} stars says a lot about how you run things."
     elif stars >= 4.0 and count > 0:
-        return f"I came across {business_name} in {city} — your reviews speak for themselves. You can tell there's a real standard behind how you operate."
+        return f"I came across {business_name} in {city} — your reviews speak for themselves."
     elif stars > 0 and count > 0:
-        return f"I came across {business_name} in {city} — it's clear you've put a lot into building something real. That stood out to me."
+        return f"I came across {business_name} in {city} — it's clear you've built something real."
     else:
-        return f"I came across {business_name} in {city} — really like what you've built. You can tell a lot of thought goes into how you run things."
+        return f"I came across {business_name} in {city} — really like what you've built."
 
 
 def generate_email(prospect):
@@ -599,18 +599,16 @@ def generate_email(prospect):
     body_text = (
         f"Hi {first_name},\n\n"
         f"{compliment}\n\n"
-        f"That's actually why I wanted to reach out. We work with "
-        f"{vertical.lower()} businesses across the GTA and what we do is "
-        f"pretty straightforward — we take a close look at how things "
-        f"run day to day, find the gaps that are quietly eating into "
-        f"your time or your margins, and bridge them. Most owners we "
-        f"sit down with are surprised by how much room there is to "
-        f"tighten things up and drive better profits.\n\n"
-        f"We're happy to take a look at no cost. If we find something "
-        f"worth addressing, we'll walk you through it. If not, you "
-        f"walk away knowing exactly where you stand.\n\n"
-        f"Open to a quick chat? Reply here or text me anytime at "
-        f"(647) 210-3737.\n\n"
+        f"We work with local {vertical.lower()} across the GTA. We take the "
+        f"time to understand how you operate, find where time and money are "
+        f"being lost, and put the right systems in place to make your business "
+        f"run more efficiently — so you can focus on the work that actually "
+        f"matters.\n\n"
+        f"Our consultations are completely free — we just sit down with you, "
+        f"learn how things run, and show you where the opportunities are. "
+        f"From there, if it makes sense for both of us, we'll put something "
+        f"together for you.\n\n"
+        f"Open to a quick chat? Reply here or text me at (647) 210-3737.\n\n"
         f"Franco Di Giovanni\n"
         f"Unify AI Partners\n"
         f"franco@unifyaipartners.ca\n\n"
@@ -621,18 +619,16 @@ def generate_email(prospect):
     body_html = (
         f"<p>Hi {first_name},</p>"
         f"<p>{compliment}</p>"
-        f"<p>That's actually why I wanted to reach out. We work with "
-        f"{vertical.lower()} businesses across the GTA and what we do is "
-        f"pretty straightforward &mdash; we take a close look at how things "
-        f"run day to day, find the gaps that are quietly eating into "
-        f"your time or your margins, and bridge them. Most owners we "
-        f"sit down with are surprised by how much room there is to "
-        f"tighten things up and drive better profits.</p>"
-        f"<p>We're happy to take a look at no cost. If we find something "
-        f"worth addressing, we'll walk you through it. If not, you "
-        f"walk away knowing exactly where you stand.</p>"
-        f"<p>Open to a quick chat? Reply here or text me anytime at "
-        f"(647) 210-3737.</p>"
+        f"<p>We work with local {vertical.lower()} across the GTA. We take the "
+        f"time to understand how you operate, find where time and money are "
+        f"being lost, and put the right systems in place to make your business "
+        f"run more efficiently &mdash; so you can focus on the work that actually "
+        f"matters.</p>"
+        f"<p>Our consultations are completely free &mdash; we just sit down with you, "
+        f"learn how things run, and show you where the opportunities are. "
+        f"From there, if it makes sense for both of us, we'll put something "
+        f"together for you.</p>"
+        f"<p>Open to a quick chat? Reply here or text me at (647) 210-3737.</p>"
         f"<p>Franco Di Giovanni<br>"
         f"<strong>Unify AI Partners</strong><br>"
         f"<a href='mailto:franco@unifyaipartners.ca'>franco@unifyaipartners.ca</a></p>"
