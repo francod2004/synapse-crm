@@ -13,6 +13,10 @@ on:
         options:
           - draft
           - send
+      max:
+        description: 'Max prospects to process (use 500 to sweep all existing)'
+        required: false
+        default: '20'
 
 jobs:
   cold-email:
@@ -38,4 +42,4 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
-        run: python cold_email_agent.py --${{ github.event.inputs.mode || 'draft' }} --max 20
+        run: python cold_email_agent.py --${{ github.event.inputs.mode || 'draft' }} --max ${{ github.event.inputs.max || '20' }}
