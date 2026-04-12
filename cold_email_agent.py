@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unify Cold Email Agent v2.0
+Unify Cold Email Agent v3.0
 =============================
 1. Searches entire CRM for leads missing owner/manager names
 2. Cross-references Facebook + LinkedIn via Google to find names & titles
@@ -314,72 +314,222 @@ def send_email_via_resend(to_email, to_name, subject, body_html, body_text):
 
 
 # ==============================================================================
-# ENRICHMENT: Find owner names via Google search of LinkedIn + Facebook
+# ENRICHMENT: Find owner names + personal emails via multiple sources
 # ==============================================================================
 
-def enrich_prospect(business_name, city):
-    """
-    Full enrichment: find owner name + Google review data.
-    Returns dict: {owner: "", source: "", stars: 0, review_count: 0}
-    """
-    result = {"owner": "", "source": "", "stars": 0, "review_count": 0}
+# Track Google rate-limit state across all enrichment calls
+_google_blocked = False
 
-    # Get Google reviews/stars
-    stars, count = _scrape_google_reviews(business_name, city)
+
+def enrich_prospect(business_name, city, website_url="", existing_email=""):
+    """
+    Full enrichment pipeline — tries 6 sources in priority order:
+      1. Google knowledge panel (fastest, often has owner name)
+      2. Business website About/Team page
+      3. LinkedIn via Google search
+      4. Facebook via Google search
+      5. Instagram via Google search
+      6. BBB via Google search
+    Also scrapes Google reviews for compliment personalization.
+    If owner found + business domain known, constructs likely personal email.
+    Returns dict: {owner, source, stars, review_count, personal_email}
+    """
+    global _google_blocked
+    result = {
+        "owner": "", "source": "", "stars": 0,
+        "review_count": 0, "personal_email": "",
+    }
+
+    # Get Google reviews/stars (also checks knowledge panel for owner)
+    stars, count, panel_owner = _scrape_google_panel(business_name, city)
     result["stars"] = stars
     result["review_count"] = count
 
-    # Try LinkedIn first, then Facebook for owner name
-    name = _search_linkedin(business_name, city)
-    if name:
-        result["owner"] = name
-        result["source"] = "LinkedIn"
+    if panel_owner:
+        result["owner"] = panel_owner
+        result["source"] = "Google"
+        result["personal_email"] = _guess_owner_email(panel_owner, existing_email, website_url)
         return result
 
-    name = _search_facebook(business_name, city)
-    if name:
-        result["owner"] = name
-        result["source"] = "Facebook"
-        return result
+    # Source pipeline — stop as soon as we find a name
+    sources = [
+        ("Website",   lambda: _scrape_website_team(website_url, business_name)),
+        ("LinkedIn",  lambda: _search_linkedin(business_name, city)),
+        ("Facebook",  lambda: _search_facebook(business_name, city)),
+        ("Instagram", lambda: _search_instagram(business_name, city)),
+        ("BBB",       lambda: _search_bbb(business_name, city)),
+    ]
+
+    for source_name, search_fn in sources:
+        if _google_blocked and source_name != "Website":
+            continue  # skip Google-dependent sources if rate-limited
+        name = search_fn()
+        if name:
+            result["owner"] = name
+            result["source"] = source_name
+            result["personal_email"] = _guess_owner_email(name, existing_email, website_url)
+            return result
 
     return result
 
 
-def _scrape_google_reviews(business_name, city):
+# -- Source 1: Google Knowledge Panel + Reviews --------------------------------
+
+def _scrape_google_panel(business_name, city):
     """
-    Search Google for business and extract star rating + review count.
-    Returns (stars: float, review_count: int) or (0, 0).
+    Single Google search that extracts:
+    - Star rating + review count (for compliments)
+    - Owner/founder name from knowledge panel snippet
+    Returns (stars, count, owner_name_or_empty)
     """
+    global _google_blocked
+    if _google_blocked:
+        return 0, 0, ""
     try:
-        query = f"{business_name} {city} reviews"
+        query = f"{business_name} {city}"
         url = f"https://www.google.com/search?q={quote_plus(query)}&gl=ca&hl=en"
         r = requests.get(url, headers=HEADERS, timeout=10)
 
+        if r.status_code == 429:
+            print(f"     [Google] 429 rate limited -- disabling Google sources")
+            _google_blocked = True
+            return 0, 0, ""
         if r.status_code != 200:
-            return 0, 0
+            return 0, 0, ""
 
         text = r.text
+        soup = BeautifulSoup(text, "lxml")
 
-        # Pattern 1: "4.5 stars" or "4.5/5" followed by review count
+        # --- Extract reviews ---
         star_match = re.search(r'(\d+\.?\d*)\s*(?:stars?|/\s*5)', text, re.I)
         count_match = re.search(r'(\d[\d,]*)\s*(?:reviews?|ratings?|Google reviews?)', text, re.I)
-
         stars = float(star_match.group(1)) if star_match else 0
         count = int(count_match.group(1).replace(",", "")) if count_match else 0
-
-        # Validate stars range
         if stars > 5:
             stars = 0
         if stars > 0:
             print(f"     [Reviews] {stars} stars, {count} reviews")
 
-        time.sleep(random.uniform(1, 2))
-        return stars, count
+        # --- Extract owner from knowledge panel ---
+        owner = ""
+        # Pattern: "Owner: Name" or "Founder: Name" in knowledge panel
+        for pattern in [
+            r'(?:Owner|Founder|Proprietor|President|CEO)\s*[:]\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+            r'(?:Owned by|Founded by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+        ]:
+            match = re.search(pattern, text)
+            if match:
+                name = match.group(1).strip()
+                if _is_valid_person_name(name):
+                    owner = name
+                    print(f"     [Google] Found in panel: {owner}")
+                    break
+
+        # Also check structured data / knowledge panel divs
+        if not owner:
+            for el in soup.select("[data-attrid*='owner'], [data-attrid*='founder']"):
+                txt = el.get_text(strip=True)
+                name_match = re.search(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)', txt)
+                if name_match and _is_valid_person_name(name_match.group(1)):
+                    owner = name_match.group(1).strip()
+                    print(f"     [Google] Found in attrid: {owner}")
+                    break
+
+        time.sleep(random.uniform(1.5, 3))
+        return stars, count, owner
 
     except Exception as e:
-        print(f"     [Reviews] Error: {e}")
-        return 0, 0
+        print(f"     [Google] Error: {e}")
+        return 0, 0, ""
 
+
+# -- Source 2: Business Website About/Team Page --------------------------------
+
+def _scrape_website_team(website_url, business_name):
+    """
+    Hit the business website's About, Team, or Staff page.
+    Look for owner/founder names in headings, meta, and body text.
+    """
+    if not website_url:
+        return ""
+
+    # Normalize URL
+    base = website_url.rstrip("/")
+    if not base.startswith("http"):
+        base = "https://" + base
+
+    # Pages to check (most common locations for owner info)
+    pages = [
+        base + "/about",
+        base + "/about-us",
+        base + "/team",
+        base + "/our-team",
+        base + "/staff",
+        base,  # homepage as fallback
+    ]
+
+    for page_url in pages:
+        try:
+            r = requests.get(page_url, headers=HEADERS, timeout=8, allow_redirects=True)
+            if r.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(r.text, "lxml")
+            text = soup.get_text(" ", strip=True)
+
+            # Method 1: Look for "Owner: Name" patterns
+            for pattern in [
+                r'(?:Owner|Founder|Proprietor|President|CEO|Principal|Director)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+                r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*[,\-]\s*(?:Owner|Founder|Proprietor|President|CEO|Principal|Director)',
+                r'(?:owned and operated by|founded by|run by|managed by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+                r'(?:Meet|About)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*[,\-]\s*(?:the\s+)?(?:owner|founder)',
+            ]:
+                match = re.search(pattern, text)
+                if match:
+                    name = match.group(1).strip()
+                    if _is_valid_person_name(name):
+                        print(f"     [Website] Found on {page_url.split('/')[-1]}: {name}")
+                        return name
+
+            # Method 2: JSON-LD structured data
+            for script in soup.select('script[type="application/ld+json"]'):
+                try:
+                    ld = json.loads(script.string or "")
+                    items = ld if isinstance(ld, list) else [ld]
+                    for item in items:
+                        for key in ("founder", "employee", "author", "member"):
+                            person = item.get(key)
+                            if isinstance(person, dict):
+                                name = person.get("name", "")
+                                if _is_valid_person_name(name):
+                                    print(f"     [Website] Found in JSON-LD: {name}")
+                                    return name
+                            elif isinstance(person, list):
+                                for p in person:
+                                    if isinstance(p, dict):
+                                        name = p.get("name", "")
+                                        if _is_valid_person_name(name):
+                                            print(f"     [Website] Found in JSON-LD: {name}")
+                                            return name
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Method 3: OG / meta author tags
+            for meta in soup.select('meta[name="author"], meta[property="article:author"]'):
+                name = (meta.get("content") or "").strip()
+                if _is_valid_person_name(name):
+                    print(f"     [Website] Found in meta: {name}")
+                    return name
+
+        except Exception:
+            continue
+
+        time.sleep(random.uniform(0.5, 1.5))
+
+    return ""
+
+
+# -- Source 3-6: Social / Directory Google Searches ----------------------------
 
 def _search_linkedin(business_name, city):
     """Search Google for LinkedIn profiles linked to this business."""
@@ -399,18 +549,39 @@ def _search_facebook(business_name, city):
     return _google_search_for_name(queries, "Facebook")
 
 
+def _search_instagram(business_name, city):
+    """Search Google for Instagram profiles — many SMB owners use their real name."""
+    queries = [
+        f'site:instagram.com "{business_name}" "{city}"',
+    ]
+    return _google_search_for_name(queries, "Instagram")
+
+
+def _search_bbb(business_name, city):
+    """Search Google for BBB listings — often include business contact names."""
+    queries = [
+        f'site:bbb.org "{business_name}" "{city}"',
+    ]
+    return _google_search_for_name(queries, "BBB")
+
+
 def _google_search_for_name(queries, source_name):
     """
     Execute Google searches and extract person names from results.
-    Works for both LinkedIn and Facebook result patterns.
+    Works for LinkedIn, Facebook, Instagram, BBB result patterns.
     """
+    global _google_blocked
+    if _google_blocked:
+        return ""
+
     for query in queries:
         try:
             url = f"https://www.google.com/search?q={quote_plus(query)}&num=5&gl=ca&hl=en"
             r = requests.get(url, headers=HEADERS, timeout=10)
 
             if r.status_code == 429:
-                print(f"     [{source_name}] Google 429 -- rate limited")
+                print(f"     [{source_name}] Google 429 -- disabling Google sources")
+                _google_blocked = True
                 return ""
             if r.status_code != 200:
                 continue
@@ -420,6 +591,7 @@ def _google_search_for_name(queries, source_name):
             # Method 1: Parse search result titles
             # LinkedIn: "FirstName LastName - Title - Company | LinkedIn"
             # Facebook: "FirstName LastName - City | Facebook"
+            # Instagram: "FirstName LastName (@handle) | Instagram"
             for div in soup.select("div.g, div[data-sokoban-container]"):
                 title_el = div.select_one("h3")
                 if not title_el:
@@ -428,7 +600,7 @@ def _google_search_for_name(queries, source_name):
 
                 # Extract name from beginning of title
                 name_match = re.match(
-                    r'^([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*[-|~]',
+                    r'^([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*[-|~(]',
                     title
                 )
                 if name_match:
@@ -445,9 +617,9 @@ def _google_search_for_name(queries, source_name):
                 snippet = snippet_el.get_text(strip=True)
 
                 for pattern in [
-                    r'(?:Owner|Founder|Manager|Director|President|CEO|Proprietor)[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)',
-                    r'([A-Z][a-z]+\s+[A-Z][a-z]+)\s*[-,]\s*(?:Owner|Founder|Manager|Director|President|CEO|Proprietor)',
-                    r'(?:owned by|founded by|managed by|operated by)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)',
+                    r'(?:Owner|Founder|Manager|Director|President|CEO|Proprietor|Principal)[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)',
+                    r'([A-Z][a-z]+\s+[A-Z][a-z]+)\s*[-,]\s*(?:Owner|Founder|Manager|Director|President|CEO|Proprietor|Principal)',
+                    r'(?:owned by|founded by|managed by|operated by|run by)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)',
                 ]:
                     match = re.search(pattern, snippet)
                     if match:
@@ -464,6 +636,60 @@ def _google_search_for_name(queries, source_name):
     return ""
 
 
+# -- Owner Email Construction --------------------------------------------------
+
+def _guess_owner_email(owner_name, existing_email, website_url):
+    """
+    Given an owner name and the business domain, generate likely personal
+    email addresses. Returns the best guess or "" if no domain available.
+
+    Common SMB patterns:
+      franco@domain.com, f.digiovanni@domain.com, franco.digiovanni@domain.com
+    """
+    # Extract domain from existing email or website
+    domain = ""
+    if existing_email and "@" in existing_email:
+        domain = existing_email.split("@")[1].strip().lower()
+    elif website_url:
+        cleaned = website_url.lower().replace("https://", "").replace("http://", "").replace("www.", "")
+        domain = cleaned.split("/")[0].strip()
+
+    if not domain:
+        return ""
+
+    parts = owner_name.lower().split()
+    if len(parts) < 2:
+        return ""
+
+    first = parts[0]
+    last = parts[-1]
+
+    # If existing email already looks personal (not generic), keep it
+    if existing_email:
+        email_local = existing_email.split("@")[0].lower()
+        generic_prefixes = {"info", "admin", "contact", "hello", "support",
+                            "sales", "office", "help", "mail", "enquiries",
+                            "inquiries", "noreply", "no-reply", "webmaster"}
+        if email_local not in generic_prefixes:
+            return ""  # they already have a personal-looking email
+
+    # Generate candidates — most common patterns for small businesses
+    candidates = [
+        f"{first}@{domain}",               # franco@joespizza.ca
+        f"{first}.{last}@{domain}",         # franco.digiovanni@joespizza.ca
+        f"{first[0]}{last}@{domain}",       # fdigiovanni@joespizza.ca
+        f"{first}{last[0]}@{domain}",       # francod@joespizza.ca
+        f"{first[0]}.{last}@{domain}",      # f.digiovanni@joespizza.ca
+    ]
+
+    # Return top candidate (firstname@domain is most common for SMBs)
+    best = candidates[0]
+    print(f"     [Email] Guessed: {best}")
+    return best
+
+
+# -- Name Validation -----------------------------------------------------------
+
 def _is_valid_person_name(name):
     """Validate that a string looks like a real person's name."""
     if not name or len(name) < 3 or len(name) > 40:
@@ -476,9 +702,16 @@ def _is_valid_person_name(name):
     false_positives = {
         "About Us", "Contact Us", "Our Team", "Home Page",
         "Read More", "Learn More", "Sign Up", "Log In",
-        "Privacy Policy", "Terms Service",
+        "Privacy Policy", "Terms Service", "Google Maps",
+        "Google Reviews", "View More", "See More", "Show More",
+        "North York", "East York", "West Toronto", "South Etobicoke",
+        "Better Business", "Yellow Pages", "White Pages",
     }
     if name in false_positives:
+        return False
+    # Filter out names that are actually locations/businesses
+    if any(w in name.lower() for w in ["inc", "ltd", "llc", "corp", "restaurant",
+                                         "pizza", "salon", "dental", "auto", "clinic"]):
         return False
     return True
 
@@ -487,52 +720,153 @@ def _is_valid_person_name(name):
 # EMAIL TEMPLATES — Industry-specific
 # ==============================================================================
 
-EMAIL_TEMPLATES = {
+# Industry-specific body paragraphs — same consultative tone, different pain points
+# Each has a "pitch" (what we do for their industry) and "consult" (free offer framing)
+VERTICAL_COPY = {
     "Restaurants": {
-        "angle": "AI-powered booking systems, automated review responses, and menu optimization",
-        "save": "10-15 hours a week",
-        "pain": "managing reservations, responding to reviews, and keeping menus updated",
+        "pitch": (
+            "We work with local restaurants across the GTA. We take the time to "
+            "understand how your front-of-house and back-of-house actually run "
+            "— reservations, orders, staffing, reviews — and find where time and "
+            "money are slipping through the cracks. Most restaurant owners we sit "
+            "down with are surprised by how much smoother things can run with "
+            "the right systems in place."
+        ),
+        "consult": (
+            "Our consultations are completely free — we just sit down with you, "
+            "walk through how things operate, and show you where the opportunities "
+            "are. From there, if it makes sense for both of us, we'll put something "
+            "together for you."
+        ),
     },
     "Retail": {
-        "angle": "AI inventory management, customer chatbots, and personalized marketing",
-        "save": "hours on manual inventory tracking and customer service",
-        "pain": "keeping track of stock, responding to customer inquiries, and running promotions",
+        "pitch": (
+            "We work with local retail businesses across the GTA. We look at "
+            "how your store actually operates day to day — inventory, customer "
+            "flow, promotions, follow-ups — and find where time and revenue are "
+            "being left on the table. Most shop owners we meet are surprised by "
+            "how much they can tighten up without changing the way they already work."
+        ),
+        "consult": (
+            "Our consultations are completely free — we sit down, learn how things "
+            "run, and show you exactly where the gaps are. If it makes sense for "
+            "both of us, we'll build something around it."
+        ),
     },
     "Trades": {
-        "angle": "AI scheduling and dispatch, automated quoting, and review management",
-        "save": "time on scheduling, follow-ups, and admin work",
-        "pain": "coordinating jobs, chasing quotes, and managing your online reputation",
+        "pitch": (
+            "We work with local trades businesses across the GTA. We look at how "
+            "jobs actually move through your operation — quoting, scheduling, "
+            "dispatch, follow-ups — and find where hours and dollars are getting "
+            "lost. Most trades owners we sit down with don't realize how much "
+            "admin work can be taken off their plate."
+        ),
+        "consult": (
+            "Our consultations are completely free — we walk through your process, "
+            "show you where things can be tightened up, and if it makes sense, "
+            "we'll put together a plan."
+        ),
     },
     "Dental & Medical": {
-        "angle": "AI appointment booking, patient reminders, and automated intake forms",
-        "save": "hours on front-desk admin and patient communication",
-        "pain": "no-shows, phone tag for appointments, and manual paperwork",
+        "pitch": (
+            "We work with local dental and medical practices across the GTA. "
+            "We take the time to understand how your front desk, booking, patient "
+            "communication, and intake actually run — and find where things are "
+            "falling through the cracks. Most practice owners we meet are surprised "
+            "by how much smoother patient flow can get."
+        ),
+        "consult": (
+            "Our consultations are completely free — we sit down with you, look "
+            "at the workflow, and show you where the bottlenecks are. From there, "
+            "if it makes sense, we'll put something together."
+        ),
     },
     "Salons & Spas": {
-        "angle": "AI online booking, no-show prediction, and client retention automation",
-        "save": "time on booking management and client follow-ups",
-        "pain": "last-minute cancellations, manual booking, and keeping clients coming back",
+        "pitch": (
+            "We work with local salons and spas across the GTA. We look at how "
+            "your booking, client follow-ups, and day-to-day operations actually "
+            "run — and find where time is being wasted and clients are slipping "
+            "away. Most salon owners we meet are surprised by how much repeat "
+            "business they're leaving on the table."
+        ),
+        "consult": (
+            "Our consultations are completely free — we learn how you operate, "
+            "show you where the opportunities are, and if it makes sense for "
+            "both of us, we'll build something around it."
+        ),
     },
     "Professional Services": {
-        "angle": "AI client intake, document automation, and smart scheduling",
-        "save": "hours on admin, paperwork, and scheduling",
-        "pain": "manual intake processes, document prep, and scheduling back-and-forth",
+        "pitch": (
+            "We work with local professional service firms across the GTA. We "
+            "look at how your client intake, scheduling, document handling, and "
+            "follow-ups actually run — and find where billable hours are getting "
+            "eaten by admin work. Most firms we sit down with don't realize how "
+            "much time they're losing to process gaps."
+        ),
+        "consult": (
+            "Our consultations are completely free — we walk through how things "
+            "work, show you where the inefficiencies are, and if it makes sense, "
+            "we'll build a plan around it."
+        ),
     },
     "Fitness & Wellness": {
-        "angle": "AI class scheduling, member retention, and billing automation",
-        "save": "time on class management and member communication",
-        "pain": "class scheduling conflicts, member churn, and billing headaches",
+        "pitch": (
+            "We work with local fitness and wellness businesses across the GTA. "
+            "We look at how your class scheduling, member communication, billing, "
+            "and retention actually run — and find where members are dropping off "
+            "and time is being wasted. Most gym and studio owners we meet are "
+            "surprised by how much they can improve without overhauling anything."
+        ),
+        "consult": (
+            "Our consultations are completely free — we sit down, learn how things "
+            "operate, and show you exactly where the gaps are. If it makes sense, "
+            "we'll put something together."
+        ),
     },
     "Auto Services": {
-        "angle": "AI appointment booking, parts inventory tracking, and customer follow-up",
-        "save": "hours on scheduling and customer reminders",
-        "pain": "missed appointments, parts tracking, and keeping customers updated",
+        "pitch": (
+            "We work with local auto service businesses across the GTA. We look "
+            "at how your appointments, parts tracking, customer updates, and "
+            "follow-ups actually run — and find where jobs are getting delayed "
+            "and customers are falling through the cracks. Most shop owners we "
+            "meet don't realize how much smoother things can run."
+        ),
+        "consult": (
+            "Our consultations are completely free — we walk through your process, "
+            "show you where time and money are being lost, and if it makes sense, "
+            "we'll build a plan."
+        ),
     },
     "Cleaning & Property": {
-        "angle": "AI scheduling and routing, automated quoting, and customer portals",
-        "save": "time on route planning, quoting, and invoicing",
-        "pain": "route inefficiencies, manual quoting, and chasing invoices",
+        "pitch": (
+            "We work with local cleaning and property service businesses across "
+            "the GTA. We look at how your quoting, scheduling, routing, and "
+            "client communication actually run — and find where jobs are "
+            "inefficient and revenue is being left behind. Most owners we sit "
+            "down with are surprised by how much tighter their operation can get."
+        ),
+        "consult": (
+            "Our consultations are completely free — we learn how things run, "
+            "show you where the opportunities are, and if it makes sense for "
+            "both of us, we'll put something together."
+        ),
     },
+}
+
+# Fallback for any vertical not in the dict
+_DEFAULT_COPY = {
+    "pitch": (
+        "We work with local businesses across the GTA. We take the time to "
+        "understand how you operate, find where time and money are being lost, "
+        "and put the right systems in place to make your business run more "
+        "efficiently — so you can focus on the work that actually matters."
+    ),
+    "consult": (
+        "Our consultations are completely free — we just sit down with you, "
+        "learn how things run, and show you where the opportunities are. "
+        "From there, if it makes sense for both of us, we'll put something "
+        "together for you."
+    ),
 }
 
 
@@ -596,18 +930,16 @@ def generate_email(prospect):
     # Personalized compliment based on Google reviews
     compliment = _generate_compliment(business_name, city, notes)
 
+    # Industry-specific body copy
+    copy = VERTICAL_COPY.get(vertical, _DEFAULT_COPY)
+    pitch = copy["pitch"]
+    consult = copy["consult"]
+
     body_text = (
         f"Hi {first_name},\n\n"
         f"{compliment}\n\n"
-        f"We work with local {vertical.lower()} across the GTA. We take the "
-        f"time to understand how you operate, find where time and money are "
-        f"being lost, and put the right systems in place to make your business "
-        f"run more efficiently — so you can focus on the work that actually "
-        f"matters.\n\n"
-        f"Our consultations are completely free — we just sit down with you, "
-        f"learn how things run, and show you where the opportunities are. "
-        f"From there, if it makes sense for both of us, we'll put something "
-        f"together for you.\n\n"
+        f"{pitch}\n\n"
+        f"{consult}\n\n"
         f"Open to a quick chat? Reply here or text me at (647) 210-3737.\n\n"
         f"Franco Di Giovanni\n"
         f"Unify AI Partners\n"
@@ -619,15 +951,8 @@ def generate_email(prospect):
     body_html = (
         f"<p>Hi {first_name},</p>"
         f"<p>{compliment}</p>"
-        f"<p>We work with local {vertical.lower()} across the GTA. We take the "
-        f"time to understand how you operate, find where time and money are "
-        f"being lost, and put the right systems in place to make your business "
-        f"run more efficiently &mdash; so you can focus on the work that actually "
-        f"matters.</p>"
-        f"<p>Our consultations are completely free &mdash; we just sit down with you, "
-        f"learn how things run, and show you where the opportunities are. "
-        f"From there, if it makes sense for both of us, we'll put something "
-        f"together for you.</p>"
+        f"<p>{pitch}</p>"
+        f"<p>{consult}</p>"
         f"<p>Open to a quick chat? Reply here or text me at (647) 210-3737.</p>"
         f"<p>Franco Di Giovanni<br>"
         f"<strong>Unify AI Partners</strong><br>"
@@ -660,7 +985,7 @@ def run_draft(max_drafts=20, dry_run=False):
     4. Save drafts to Franco's Gmail inbox
     """
     print("=" * 60)
-    print("  Unify Cold Email Agent v2.0 — DRAFT MODE")
+    print("  Unify Cold Email Agent v3.0 — DRAFT MODE")
     print("=" * 60)
     print(f"  Max drafts  : {max_drafts}")
     print(f"  Dry run     : {dry_run}")
@@ -688,8 +1013,7 @@ def run_draft(max_drafts=20, dry_run=False):
     print(f"  Found {len(needs_enrichment)} prospects without owner names")
 
     enriched_count = 0
-    enriched_linkedin = 0
-    enriched_facebook = 0
+    source_counts = {}  # Track which sources find names
 
     # Cap enrichment to max_drafts * 2 to keep runs fast
     enrich_limit = max_drafts * 2
@@ -699,6 +1023,14 @@ def run_draft(max_drafts=20, dry_run=False):
         pid = prospect.get("id", "unknown")
         name = prospect.get("name", "Unknown")
         address = prospect.get("address", "")
+        existing_email = prospect.get("email", "")
+        website = prospect.get("source", "")  # website URL if available from sourcer
+
+        # Extract website URL from notes if stored there
+        notes = prospect.get("notes", "") or ""
+        url_match = re.search(r'https?://[^\s]+', notes)
+        if url_match and not website:
+            website = url_match.group(0)
 
         # Extract city for search
         city = "Toronto"
@@ -710,38 +1042,41 @@ def run_draft(max_drafts=20, dry_run=False):
                 city = parts[0].strip()
 
         print(f"\n  Enriching: {name} ({city})")
-        enrichment = enrich_prospect(name, city)
+        enrichment = enrich_prospect(name, city, website_url=website, existing_email=existing_email)
 
         # Store review data regardless of owner name result
         if enrichment["stars"] > 0 and not dry_run:
-            notes = prospect.get("notes", "") or ""
             review_note = f" | {enrichment['stars']} stars, {enrichment['review_count']} reviews"
             if review_note not in notes:
-                url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
-                requests.patch(url, headers=sb_headers(),
+                patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
+                requests.patch(patch_url, headers=sb_headers(),
                     json={"notes": notes + review_note}, timeout=15)
 
         if enrichment["owner"]:
             enriched_count += 1
-            if enrichment["source"] == "LinkedIn":
-                enriched_linkedin += 1
-            else:
-                enriched_facebook += 1
+            src = enrichment["source"]
+            source_counts[src] = source_counts.get(src, 0) + 1
 
-            print(f"    Found: {enrichment['owner']} via {enrichment['source']}")
+            print(f"    Found: {enrichment['owner']} via {src}")
             if not dry_run:
+                update_data = {"owner": enrichment["owner"], "action": "Ready for cold email"}
+                # If we found a personal email, upgrade their email field
+                if enrichment["personal_email"]:
+                    update_data["email"] = enrichment["personal_email"]
+                    print(f"    Personal email: {enrichment['personal_email']}")
                 update_prospect_owner(pid, enrichment["owner"])
-                url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
-                requests.patch(url, headers=sb_headers(),
-                    json={"action": "Ready for cold email"}, timeout=15)
+                patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
+                requests.patch(patch_url, headers=sb_headers(),
+                    json=update_data, timeout=15)
         else:
             print(f"    No owner found")
 
         # Rate limit between searches
         time.sleep(random.uniform(2, 4))
 
+    source_summary = ", ".join(f"{v} {k}" for k, v in sorted(source_counts.items(), key=lambda x: -x[1]))
     print(f"\n  Enrichment complete: {enriched_count} names found")
-    print(f"    LinkedIn: {enriched_linkedin}, Facebook: {enriched_facebook}")
+    print(f"    Sources: {source_summary or 'none'}")
 
     # =========================================================================
     # PHASE 2: Draft emails for prospects with owner names
@@ -848,7 +1183,7 @@ def run_draft(max_drafts=20, dry_run=False):
 def run_send(dry_run=False):
     """Send approved emails from agent_queue via Resend API."""
     print("=" * 60)
-    print("  Unify Cold Email Agent v2.0 — SEND MODE")
+    print("  Unify Cold Email Agent v3.0 — SEND MODE")
     print("=" * 60)
     print(f"  Resend : {'Configured' if RESEND_API_KEY else 'No key'}")
     print(f"  Sender : {SENDER_EMAIL}")
@@ -913,7 +1248,7 @@ def run_send(dry_run=False):
 # -- CLI ----------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Unify Cold Email Agent v2.0")
+    parser = argparse.ArgumentParser(description="Unify Cold Email Agent v3.0")
     parser.add_argument("--draft", action="store_true",
                         help="Enrich names + generate email drafts in Gmail")
     parser.add_argument("--send", action="store_true",
