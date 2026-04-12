@@ -131,6 +131,7 @@ body::before{content:'';position:fixed;top:-100px;left:50%;transform:translateX(
 /* ── Status pills ───────────────────────────── */
 .pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap}
 .pill-grey{background:rgba(107,114,128,.2);color:#9CA3AF}
+.pill-orange{background:rgba(249,115,22,.15);color:#FB923C}
 .pill-yellow{background:rgba(245,158,11,.15);color:#F59E0B}
 .pill-blue{background:rgba(59,130,246,.15);color:#60A5FA}
 .pill-green{background:rgba(16,185,129,.15);color:#34D399}
@@ -186,7 +187,7 @@ body::before{content:'';position:fixed;top:-100px;left:50%;transform:translateX(
 .modal-field input:focus,.modal-field select:focus,.modal-field textarea:focus{outline:none;border-color:var(--purple)}
 .modal-field select{appearance:none;cursor:pointer}
 .modal-field textarea{min-height:70px;resize:vertical}
-.modal-stage-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:4px}
+.modal-stage-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin-top:4px}
 .modal-stage-btn{padding:8px 4px;border-radius:8px;border:2px solid transparent;font-size:10px;font-weight:600;cursor:pointer;text-align:center;line-height:1.3;transition:all .1s}
 .modal-stage-btn.sel{border-color:#fff;box-shadow:0 0 0 1px #fff}
 .modal-actions{display:flex;gap:10px;margin-top:20px}
@@ -209,10 +210,11 @@ body::before{content:'';position:fixed;top:-100px;left:50%;transform:translateX(
 .stats-section{margin-bottom:28px}
 .stats-section-title{font-family:'Lexend Giga',sans-serif;font-size:13px;font-weight:700;color:var(--text);letter-spacing:.3px;margin-bottom:14px;display:flex;align-items:center;gap:10px}
 .stats-section-title::after{content:'';flex:1;height:1px;background:var(--border)}
-.kpi-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:28px}
+.kpi-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:28px}
 .kpi-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px 18px;position:relative;overflow:hidden}
 .kpi-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
 .kpi-grey::before{background:#6B7280}
+.kpi-orange::before{background:#F97316}
 .kpi-yellow::before{background:#F59E0B}
 .kpi-blue::before{background:#3B82F6}
 .kpi-green::before{background:#10B981}
@@ -448,6 +450,7 @@ body::before{content:'';position:fixed;top:-100px;left:50%;transform:translateX(
         <label>Pipeline Stage</label>
         <div class="modal-stage-grid" id="modal-stage-grid">
           <button class="modal-stage-btn sel" style="background:#6B7280;color:#fff" onclick="selectModalStage(this,'NOT CONTACTED')">Not Contacted</button>
+          <button class="modal-stage-btn" style="background:#F97316;color:#fff" onclick="selectModalStage(this,'PHONE CALL READY')">Phone Call Ready</button>
           <button class="modal-stage-btn" style="background:#F59E0B;color:#1A1035" onclick="selectModalStage(this,'AUDIT BOOKED')">Audit Booked</button>
           <button class="modal-stage-btn" style="background:#3B82F6;color:#fff" onclick="selectModalStage(this,'QUOTE ACCEPTED')">Quote Accepted</button>
           <button class="modal-stage-btn" style="background:#10B981;color:#fff" onclick="selectModalStage(this,'TERMS ACCEPTED')">Terms Accepted</button>
@@ -675,13 +678,14 @@ function getSegColor(cat){ return (segments.find(s=>s.name===cat)||{color:'#6B72
 // ════════════════════════════════════════════════
 // ROUTING
 // ════════════════════════════════════════════════
-const STAGES = ['NOT CONTACTED','AUDIT BOOKED','QUOTE ACCEPTED','TERMS ACCEPTED','LOST / DEAD'];
+const STAGES = ['NOT CONTACTED','PHONE CALL READY','AUDIT BOOKED','QUOTE ACCEPTED','TERMS ACCEPTED','LOST / DEAD'];
 const STAGE_STYLE = {
-  'NOT CONTACTED': {pill:'pill-grey',dot:'#6B7280',bar:'#6B7280',kanban:'#1C1C24',kh:'#252532',kt:'#9CA3AF',kc:'rgba(107,114,128,.2)'},
-  'AUDIT BOOKED':  {pill:'pill-yellow',dot:'#F59E0B',bar:'#F59E0B',kanban:'#1C1800',kh:'#241F00',kt:'#FCD34D',kc:'rgba(245,158,11,.2)'},
-  'QUOTE ACCEPTED':{pill:'pill-blue',dot:'#3B82F6',bar:'#3B82F6',kanban:'#0A1020',kh:'#0D1428',kt:'#60A5FA',kc:'rgba(59,130,246,.2)'},
-  'TERMS ACCEPTED':{pill:'pill-green',dot:'#10B981',bar:'#10B981',kanban:'#051410',kh:'#071A12',kt:'#34D399',kc:'rgba(16,185,129,.2)'},
-  'LOST / DEAD':   {pill:'pill-red',dot:'#EF4444',bar:'#EF4444',kanban:'#1A0808',kh:'#200A0A',kt:'#F87171',kc:'rgba(239,68,68,.2)'},
+  'NOT CONTACTED':   {pill:'pill-grey',dot:'#6B7280',bar:'#6B7280',kanban:'#1C1C24',kh:'#252532',kt:'#9CA3AF',kc:'rgba(107,114,128,.2)'},
+  'PHONE CALL READY':{pill:'pill-orange',dot:'#F97316',bar:'#F97316',kanban:'#1A1000',kh:'#241600',kt:'#FB923C',kc:'rgba(249,115,22,.2)'},
+  'AUDIT BOOKED':    {pill:'pill-yellow',dot:'#F59E0B',bar:'#F59E0B',kanban:'#1C1800',kh:'#241F00',kt:'#FCD34D',kc:'rgba(245,158,11,.2)'},
+  'QUOTE ACCEPTED':  {pill:'pill-blue',dot:'#3B82F6',bar:'#3B82F6',kanban:'#0A1020',kh:'#0D1428',kt:'#60A5FA',kc:'rgba(59,130,246,.2)'},
+  'TERMS ACCEPTED':  {pill:'pill-green',dot:'#10B981',bar:'#10B981',kanban:'#051410',kh:'#071A12',kt:'#34D399',kc:'rgba(16,185,129,.2)'},
+  'LOST / DEAD':     {pill:'pill-red',dot:'#EF4444',bar:'#EF4444',kanban:'#1A0808',kh:'#200A0A',kt:'#F87171',kc:'rgba(239,68,68,.2)'},
 };
 // CAT_ICON replaced by dynamic getSegIcon()
 
@@ -933,9 +937,10 @@ function renderStats(){
 
   // Conversion rates between stages
   const convRates = [
-    {from:'NOT CONTACTED', to:'AUDIT BOOKED', label:'Contact → Audit'},
-    {from:'AUDIT BOOKED',  to:'QUOTE ACCEPTED',label:'Audit → Quote'},
-    {from:'QUOTE ACCEPTED',to:'TERMS ACCEPTED',label:'Quote → Close'},
+    {from:'NOT CONTACTED',   to:'PHONE CALL READY',label:'Email → Call Ready'},
+    {from:'PHONE CALL READY',to:'AUDIT BOOKED',     label:'Call → Audit'},
+    {from:'AUDIT BOOKED',    to:'QUOTE ACCEPTED',   label:'Audit → Quote'},
+    {from:'QUOTE ACCEPTED',  to:'TERMS ACCEPTED',   label:'Quote → Close'},
   ];
   const convData = convRates.map(r=>{
     const fromCount = prospects.filter(p=>
@@ -1018,6 +1023,11 @@ function renderStats(){
       <div class="kpi-val">${sc['NOT CONTACTED']}</div>
       <div class="kpi-sub">${total?Math.round(sc['NOT CONTACTED']/total*100):0}% of pipeline</div>
     </div>
+    <div class="kpi-card kpi-orange">
+      <div class="kpi-label">Phone Call Ready</div>
+      <div class="kpi-val">${sc['PHONE CALL READY']}</div>
+      <div class="kpi-sub">Email drafted — call next</div>
+    </div>
     <div class="kpi-card kpi-yellow">
       <div class="kpi-label">Audits Booked</div>
       <div class="kpi-val">${sc['AUDIT BOOKED']}</div>
@@ -1045,7 +1055,7 @@ function renderStats(){
     <div class="stat-box">
       <div class="stat-box-title">Conversion Funnel</div>
       ${convData.map(r=>{
-        const colors = {'Contact → Audit':'#F59E0B','Audit → Quote':'#3B82F6','Quote → Close':'#10B981'};
+        const colors = {'Email → Call Ready':'#F97316','Call → Audit':'#F59E0B','Audit → Quote':'#3B82F6','Quote → Close':'#10B981'};
         const col = colors[r.label]||'#024AA5';
         return `<div class="conv-row">
           <div class="conv-from" style="font-size:11px">${r.label}</div>
@@ -1238,7 +1248,7 @@ function openDetail(id){
             const sst = STAGE_STYLE[s];
             const sel = p.status===s;
             const colors = {
-              'NOT CONTACTED':'#6B7280','AUDIT BOOKED':'#F59E0B',
+              'NOT CONTACTED':'#6B7280','PHONE CALL READY':'#F97316','AUDIT BOOKED':'#F59E0B',
               'QUOTE ACCEPTED':'#3B82F6','TERMS ACCEPTED':'#10B981','LOST / DEAD':'#EF4444'
             };
             return `<div class="stage-opt ${sel?'sel':''}" 
