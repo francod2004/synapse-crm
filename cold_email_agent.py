@@ -1132,12 +1132,19 @@ def run_draft(max_drafts=20, dry_run=False):
         # Also save to agent_queue for tracking
         insert_draft_to_queue(pid, email_data)
 
+        # Move prospect from "Not Contacted" → "Phone Call Ready"
+        patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
+        requests.patch(patch_url, headers=sb_headers(), json={
+            "status": "PHONE CALL READY",
+            "action": "Email drafted — review in Gmail, then call",
+        }, timeout=15)
+
         if gmail_ok:
             drafted += 1
-            print(f"    Saved to Gmail drafts + agent_queue")
+            print(f"    Saved to Gmail + queue — status → Phone Call Ready")
         else:
             drafted += 1
-            print(f"    Saved to agent_queue only (Gmail unavailable)")
+            print(f"    Saved to queue — status → Phone Call Ready (Gmail unavailable)")
 
     # =========================================================================
     # SUMMARY + SMS
@@ -1145,7 +1152,7 @@ def run_draft(max_drafts=20, dry_run=False):
     print("\n" + "=" * 60)
     print(f"  Unify Cold Email Agent — Draft Complete")
     print(f"  {'='*56}")
-    print(f"     Names enriched     : {enriched_count} ({enriched_linkedin} LinkedIn, {enriched_facebook} Facebook)")
+    print(f"     Names enriched     : {enriched_count} ({source_summary or 'none'})")
     print(f"     Email drafts       : {drafted}")
     print(f"     Saved to Gmail     : {'Yes' if gmail else 'No (token missing)'}")
     print("=" * 60)

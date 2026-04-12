@@ -2,7 +2,7 @@ name: Unify Cold Email Agent
 
 on:
   schedule:
-    - cron: '0 15 * * *'  # 11 AM EDT (1 hour after lead sourcer)
+    - cron: '0 12,15,18,21 * * *'  # Runs at 8 AM, 11 AM, 2 PM, 5 PM EDT
   workflow_dispatch:
     inputs:
       mode:
