@@ -725,130 +725,131 @@ def _is_valid_person_name(name):
 VERTICAL_COPY = {
     "Restaurants": {
         "pitch": (
-            "We work with local restaurants across the GTA. We take the time to "
-            "understand how your front-of-house and back-of-house actually run "
-            "— reservations, orders, staffing, reviews — and find where time and "
-            "money are slipping through the cracks. Most restaurant owners we sit "
-            "down with are surprised by how much smoother things can run with "
-            "the right systems in place."
+            "We work with local restaurants across the GTA. We take the time "
+            "to really understand how your operation runs — not just the "
+            "surface level stuff, but the day-to-day things that quietly eat "
+            "into your time and your margins. Most restaurant owners we sit "
+            "down with are surprised by what we find."
         ),
         "consult": (
-            "Our consultations are completely free — we just sit down with you, "
-            "walk through how things operate, and show you where the opportunities "
-            "are. From there, if it makes sense for both of us, we'll put something "
-            "together for you."
+            "Our consultations are completely free — we just sit down with "
+            "you, learn how things work from the inside, and show you where "
+            "the opportunities are. From there, if it makes sense for both "
+            "of us, we'll put something together for you."
         ),
     },
     "Retail": {
         "pitch": (
-            "We work with local retail businesses across the GTA. We look at "
-            "how your store actually operates day to day — inventory, customer "
-            "flow, promotions, follow-ups — and find where time and revenue are "
-            "being left on the table. Most shop owners we meet are surprised by "
-            "how much they can tighten up without changing the way they already work."
+            "We work with local retail businesses across the GTA. We spend "
+            "time understanding how your store actually operates — not just "
+            "what's visible, but the behind-the-scenes work that's costing "
+            "you time and money without you even realizing it. Most shop "
+            "owners we meet are surprised by how much room there is to "
+            "tighten things up."
         ),
         "consult": (
-            "Our consultations are completely free — we sit down, learn how things "
-            "run, and show you exactly where the gaps are. If it makes sense for "
-            "both of us, we'll build something around it."
+            "Our consultations are completely free — we sit down, learn how "
+            "things run, and show you exactly where the gaps are. If it makes "
+            "sense for both of us, we'll build something around it."
         ),
     },
     "Trades": {
         "pitch": (
-            "We work with local trades businesses across the GTA. We look at how "
-            "jobs actually move through your operation — quoting, scheduling, "
-            "dispatch, follow-ups — and find where hours and dollars are getting "
-            "lost. Most trades owners we sit down with don't realize how much "
-            "admin work can be taken off their plate."
+            "We work with local trades businesses across the GTA. We take "
+            "the time to understand how your operation actually moves — from "
+            "the first call to the finished job — and find where hours and "
+            "dollars are quietly getting lost. Most trades owners we sit "
+            "down with don't realize how much is slipping through the cracks."
         ),
         "consult": (
-            "Our consultations are completely free — we walk through your process, "
-            "show you where things can be tightened up, and if it makes sense, "
-            "we'll put together a plan."
+            "Our consultations are completely free — we walk through your "
+            "process, show you where things can be tightened up, and if it "
+            "makes sense, we'll put together a plan."
         ),
     },
     "Dental & Medical": {
         "pitch": (
             "We work with local dental and medical practices across the GTA. "
-            "We take the time to understand how your front desk, booking, patient "
-            "communication, and intake actually run — and find where things are "
-            "falling through the cracks. Most practice owners we meet are surprised "
-            "by how much smoother patient flow can get."
+            "We take the time to understand how your practice actually runs "
+            "day to day — the stuff that takes up your team's time and holds "
+            "things back from running as smoothly as they could. Most practice "
+            "owners we meet are surprised by what comes up."
         ),
         "consult": (
-            "Our consultations are completely free — we sit down with you, look "
-            "at the workflow, and show you where the bottlenecks are. From there, "
-            "if it makes sense, we'll put something together."
+            "Our consultations are completely free — we sit down with you, "
+            "look at how things work on the ground, and show you where the "
+            "real bottlenecks are. From there, if it makes sense, we'll put "
+            "something together."
         ),
     },
     "Salons & Spas": {
         "pitch": (
-            "We work with local salons and spas across the GTA. We look at how "
-            "your booking, client follow-ups, and day-to-day operations actually "
-            "run — and find where time is being wasted and clients are slipping "
-            "away. Most salon owners we meet are surprised by how much repeat "
-            "business they're leaving on the table."
+            "We work with local salons and spas across the GTA. We take the "
+            "time to understand how your business actually operates — the "
+            "things that eat into your day and cost you clients without you "
+            "always seeing it. Most salon owners we meet are surprised by "
+            "how much they're leaving on the table."
         ),
         "consult": (
-            "Our consultations are completely free — we learn how you operate, "
-            "show you where the opportunities are, and if it makes sense for "
-            "both of us, we'll build something around it."
+            "Our consultations are completely free — we learn how you "
+            "operate, show you where the opportunities are, and if it makes "
+            "sense for both of us, we'll build something around it."
         ),
     },
     "Professional Services": {
         "pitch": (
-            "We work with local professional service firms across the GTA. We "
-            "look at how your client intake, scheduling, document handling, and "
-            "follow-ups actually run — and find where billable hours are getting "
-            "eaten by admin work. Most firms we sit down with don't realize how "
-            "much time they're losing to process gaps."
+            "We work with local professional service firms across the GTA. "
+            "We take the time to understand how your firm actually operates "
+            "— the processes that quietly eat into your team's time and keep "
+            "things from running as efficiently as they should. Most firms we "
+            "sit down with don't realize how much they're losing to it."
         ),
         "consult": (
-            "Our consultations are completely free — we walk through how things "
-            "work, show you where the inefficiencies are, and if it makes sense, "
-            "we'll build a plan around it."
+            "Our consultations are completely free — we walk through how "
+            "things work, show you where the inefficiencies are, and if it "
+            "makes sense, we'll build a plan around it."
         ),
     },
     "Fitness & Wellness": {
         "pitch": (
-            "We work with local fitness and wellness businesses across the GTA. "
-            "We look at how your class scheduling, member communication, billing, "
-            "and retention actually run — and find where members are dropping off "
-            "and time is being wasted. Most gym and studio owners we meet are "
-            "surprised by how much they can improve without overhauling anything."
+            "We work with local fitness and wellness businesses across the "
+            "GTA. We take the time to understand how your business actually "
+            "runs — the things that take up your time, cost you members, and "
+            "keep things from operating as smoothly as they could. Most gym "
+            "and studio owners we meet are surprised by what we uncover."
         ),
         "consult": (
-            "Our consultations are completely free — we sit down, learn how things "
-            "operate, and show you exactly where the gaps are. If it makes sense, "
-            "we'll put something together."
+            "Our consultations are completely free — we sit down, learn how "
+            "things operate, and show you exactly where the gaps are. If it "
+            "makes sense, we'll put something together."
         ),
     },
     "Auto Services": {
         "pitch": (
-            "We work with local auto service businesses across the GTA. We look "
-            "at how your appointments, parts tracking, customer updates, and "
-            "follow-ups actually run — and find where jobs are getting delayed "
-            "and customers are falling through the cracks. Most shop owners we "
-            "meet don't realize how much smoother things can run."
+            "We work with local auto service businesses across the GTA. We "
+            "take the time to understand how your shop actually runs — the "
+            "things that slow jobs down, cost you customers, and eat into "
+            "your bottom line without always being obvious. Most shop owners "
+            "we meet don't realize how much smoother things can get."
         ),
         "consult": (
-            "Our consultations are completely free — we walk through your process, "
-            "show you where time and money are being lost, and if it makes sense, "
-            "we'll build a plan."
+            "Our consultations are completely free — we walk through your "
+            "operation, show you where time and money are being lost, and if "
+            "it makes sense, we'll build a plan."
         ),
     },
     "Cleaning & Property": {
         "pitch": (
-            "We work with local cleaning and property service businesses across "
-            "the GTA. We look at how your quoting, scheduling, routing, and "
-            "client communication actually run — and find where jobs are "
-            "inefficient and revenue is being left behind. Most owners we sit "
-            "down with are surprised by how much tighter their operation can get."
+            "We work with local cleaning and property service businesses "
+            "across the GTA. We take the time to understand how your "
+            "operation actually runs — the things that quietly slow you down, "
+            "cost you jobs, and eat into your profits. Most owners we sit "
+            "down with are surprised by how much tighter things can get."
         ),
         "consult": (
-            "Our consultations are completely free — we learn how things run, "
-            "show you where the opportunities are, and if it makes sense for "
-            "both of us, we'll put something together."
+            "Our consultations are completely free — we learn how things "
+            "run, show you where the opportunities are, and if it makes "
+            "sense for both of us, we'll put something together."
         ),
     },
 }
@@ -857,9 +858,9 @@ VERTICAL_COPY = {
 _DEFAULT_COPY = {
     "pitch": (
         "We work with local businesses across the GTA. We take the time to "
-        "understand how you operate, find where time and money are being lost, "
-        "and put the right systems in place to make your business run more "
-        "efficiently — so you can focus on the work that actually matters."
+        "understand how you operate, find where time and money are being "
+        "lost, and put the right systems in place to help your business run "
+        "more efficiently — so you can focus on the work that actually matters."
     ),
     "consult": (
         "Our consultations are completely free — we just sit down with you, "
