@@ -1590,8 +1590,21 @@ def run_draft(max_drafts=20, dry_run=False, redraft=False):
     print(f"  Gmail       : Checking...")
     print()
 
-    # If redraft, clear old queue entries first
+    # If redraft, reset stages and clear old queue entries
     if redraft and not dry_run:
+        # Reset "Phone Call Ready" prospects back to "Not Contacted"
+        reset_url = (
+            f"{SUPABASE_URL}/rest/v1/prospects"
+            f"?stage=eq.Phone Call Ready"
+        )
+        r = requests.patch(reset_url, headers=sb_headers(),
+                           json={"stage": "Not Contacted", "next_action": None},
+                           timeout=15)
+        if r.status_code in (200, 204):
+            reset_count = len(r.json()) if r.text.strip() else 0
+            print(f"  Reset {reset_count} prospects from Phone Call Ready -> Not Contacted")
+        else:
+            print(f"  WARNING: Could not reset stages ({r.status_code})")
         _clear_cold_email_queue()
 
     # Set up Gmail
