@@ -254,6 +254,60 @@ def is_chain_or_franchise(name):
             return True
     return False
 
+# ---- Target market filters (2-25 employees, owner-operated, single/double location) ----
+
+# Signals that a business is too large (3+ locations, corporate, enterprise)
+_TOO_LARGE_PATTERNS = [
+    r'(\d+)\s*locations?',          # "5 locations", "12 locations"
+    r'(\d+)\s*branches?',           # "3 branches"
+    r'(\d+)\s*offices?',            # "4 offices"
+    r'serving\s+\d+\s*(?:provinces?|countries)',  # "serving 3 provinces"
+    r'nation\s*wide',               # "nationwide"
+    r'across\s+canada',             # "across Canada"
+    r'coast\s+to\s+coast',          # "coast to coast"
+]
+_TOO_LARGE_KEYWORDS = {
+    "corporate office", "corporate headquarters", "head office",
+    "enterprise solutions", "enterprise clients",
+    "publicly traded", "nasdaq", "tsx",
+    "fortune 500", "inc. 5000",
+}
+
+# Signals that a business is too small (solo, home-based, no real storefront)
+_TOO_SMALL_KEYWORDS = {
+    "freelance", "freelancer",
+    "independent consultant",
+    "home-based", "home based",
+    "by appointment only",  # often solo operators
+    "one-man", "one man",
+    "solo practitioner",
+}
+
+
+def is_too_large(name, address="", notes=""):
+    """Check if business signals 3+ locations or corporate scale."""
+    text = f"{name} {address} {notes}".lower()
+    for kw in _TOO_LARGE_KEYWORDS:
+        if kw in text:
+            return True
+    for pattern in _TOO_LARGE_PATTERNS:
+        m = re.search(pattern, text, re.I)
+        if m and m.group(0)[0].isdigit():
+            count = int(re.search(r'\d+', m.group(0)).group())
+            if count >= 3:
+                return True
+    return False
+
+
+def is_too_small(name, address="", notes=""):
+    """Check if business signals solo operator or home-based."""
+    text = f"{name} {address} {notes}".lower()
+    for kw in _TOO_SMALL_KEYWORDS:
+        if kw in text:
+            return True
+    return False
+
+
 def clean_business_name(name):
     """Clean up scraped business name."""
     name = re.sub(r'^\d+', '', name).strip()
@@ -1192,6 +1246,8 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
     skipped_no_name = 0
     skipped_duplicate = 0
     skipped_chain = 0
+    skipped_too_large = 0
+    skipped_too_small = 0
     saved_no_name = 0
 
     # Shuffle verticals so each daily run covers different industries
@@ -1232,6 +1288,20 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
                     if norm_name in existing:
                         print(f"   SKIP duplicate: {raw['name']}")
                         skipped_duplicate += 1
+                        continue
+
+                    # TARGET MARKET FILTER: skip too-large businesses (3+ locations, corporate)
+                    raw_addr = raw.get("address", "")
+                    raw_notes = raw.get("notes", "")
+                    if is_too_large(raw["name"], raw_addr, raw_notes):
+                        print(f"   SKIP (too large/corporate): {raw['name']}")
+                        skipped_too_large += 1
+                        continue
+
+                    # TARGET MARKET FILTER: skip too-small businesses (solo, home-based)
+                    if is_too_small(raw["name"], raw_addr, raw_notes):
+                        print(f"   SKIP (too small/home-based): {raw['name']}")
+                        skipped_too_small += 1
                         continue
 
                     # Enrich from website
@@ -1301,6 +1371,8 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
     print(f"     With owner name    : {len(all_leads) - saved_no_name}")
     print(f"     No name (email+ph) : {saved_no_name}")
     print(f"     Skipped (no name)  : {skipped_no_name}")
+    print(f"     Skipped (too large): {skipped_too_large}")
+    print(f"     Skipped (too small): {skipped_too_small}")
     print(f"     Skipped (duplicate): {skipped_duplicate}")
     print(f"     Source performance : {circuit_breaker.summary()}")
     print("=" * 60)
@@ -1355,7 +1427,8 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
             f"Unify: {inserted} new leads added! "
             f"{named} with owner name, {saved_no_name} need name enrichment. "
             f"({breakdown}). "
-            f"Skipped: {skipped_no_name} no-info, {skipped_duplicate} dupes. "
+            f"Skipped: {skipped_no_name} no-info, {skipped_duplicate} dupes, "
+            f"{skipped_too_large} too-large, {skipped_too_small} too-small. "
             f"Review: unify-crm-coral.vercel.app"
         )
     elif all_leads and not dry_run:
@@ -1368,7 +1441,8 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
     else:
         msg = (
             f"Unify: Lead sourcer ran - 0 new leads. "
-            f"Skipped: {skipped_no_name} no-info, {skipped_duplicate} dupes. "
+            f"Skipped: {skipped_no_name} no-info, {skipped_duplicate} dupes, "
+            f"{skipped_too_large} too-large, {skipped_too_small} too-small. "
             f"Next run may yield different results."
         )
 
