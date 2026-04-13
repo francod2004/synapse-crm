@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Unify Cold Email Agent v4.0
+Unify Cold Email Agent v5.0
 =============================
-1. Searches entire CRM for leads missing owner/manager names
-2. Cross-references Facebook + LinkedIn via Google to find names & titles
-3. Drafts personalized cold emails using industry-specific templates
-4. Saves drafts directly into Franco's Gmail for review and sending
+1. Enriches CRM leads (owner names, emails, years in business, specialization)
+2. Drafts personalized cold emails using 3-tier hook + 9 vertical templates
+3. Saves drafts directly into Franco's Gmail for review and sending
+4. Owner name preferred but NOT required — "Hi there" fallback
 
 Two modes:
-  --draft  : Enrich names + create Gmail drafts (runs daily, unattended)
+  --draft  : Enrich leads + create Gmail drafts (runs daily, unattended)
   --send   : Send all approved emails from agent_queue via Resend (manual)
 
 RULE: Never send an email without Franco's explicit approval.
@@ -181,23 +181,23 @@ def get_prospects_needing_enrichment():
 
 def get_prospects_to_email():
     """
-    Fetch prospects ready for email drafting:
-    - Has owner name
-    - Has email (not generic)
-    - Status = NOT CONTACTED
+    Fetch prospects ready for email drafting.
+    The ONLY hard filter is: must have an email address.
+    Owner name is preferred but NOT required — use "Hi there" fallback.
     """
     all_prospects = get_all_prospects()
     ready = []
+    # Dead-end email prefixes — never worth emailing
+    dead_ends = {"noreply@", "no-reply@", "donotreply@", "do-not-reply@"}
     for p in all_prospects:
-        owner = (p.get("owner") or "").strip()
         email = (p.get("email") or "").strip().lower()
         status = (p.get("status") or "").strip().upper()
 
-        # Owner name is the ONLY hard filter — no name = can't personalize
-        if not owner:
-            continue
-        # Must have some email (generic like info@ is fine if we have a name)
+        # Email is the ONLY hard filter
         if not email or "@" not in email:
+            continue
+        # Skip dead-end addresses
+        if any(email.startswith(d) for d in dead_ends):
             continue
         if status != "NOT CONTACTED":
             continue
@@ -367,6 +367,7 @@ def enrich_prospect(business_name, city, website_url="", existing_email=""):
     result = {
         "owner": "", "source": "", "stars": 0,
         "review_count": 0, "personal_email": "", "found_email": "",
+        "years_in_business": 0, "specialization": "",
     }
 
     # =========================================================================
@@ -375,6 +376,12 @@ def enrich_prospect(business_name, city, website_url="", existing_email=""):
     # =========================================================================
     print(f"     [YP] Searching for {business_name} in {city}...")
     yp_result = _scrape_yellowpages_owner(business_name, city)
+
+    # Always grab YP enrichment data (years, specialization) regardless of owner
+    if yp_result.get("years_in_business"):
+        result["years_in_business"] = yp_result["years_in_business"]
+    if yp_result.get("specialization"):
+        result["specialization"] = yp_result["specialization"]
 
     if yp_result.get("owner"):
         result["owner"] = yp_result["owner"]
@@ -644,7 +651,7 @@ def _scrape_yellowpages_owner(business_name, city):
     Search YellowPages.ca directly (no Google needed — proven on GitHub Actions).
     Returns dict: {owner, email, website} or empty values.
     """
-    result = {"owner": "", "email": "", "website": ""}
+    result = {"owner": "", "email": "", "website": "", "years_in_business": 0, "specialization": ""}
     try:
         location = f"{city}+ON".replace(" ", "+")
         search_url = (
@@ -773,6 +780,31 @@ def _scrape_yellowpages_owner(business_name, city):
                     if not any(d in href.lower() for d in _SKIP_WEBSITE_DOMAINS):
                         result["website"] = href
                         break
+
+            # Extract years in business from detail page
+            years_match = re.search(
+                r'(?:in\s*business\s*since|established|since|founded)\s*:?\s*(\d{4})',
+                detail_text, re.I
+            )
+            if years_match:
+                founded = int(years_match.group(1))
+                result["years_in_business"] = datetime.now().year - founded
+                if result["years_in_business"] > 0:
+                    print(f"     [YP] Years in business: {result['years_in_business']}")
+            if not result["years_in_business"]:
+                yrs_match = re.search(r'(\d+)\+?\s*years?\s*(?:in\s*business|of\s*experience|serving)', detail_text, re.I)
+                if yrs_match:
+                    result["years_in_business"] = int(yrs_match.group(1))
+                    print(f"     [YP] Years in business: {result['years_in_business']}")
+
+            # Extract specialization/subcategory from detail page
+            cat_el = detail_soup.select_one(
+                "span.listing__category, a.listing__category, "
+                "span[class*='category'], div.categories a"
+            )
+            if cat_el:
+                result["specialization"] = cat_el.get_text(strip=True)
+                print(f"     [YP] Specialization: {result['specialization']}")
 
         if result["email"]:
             print(f"     [YP] Email found: {result['email']}")
@@ -1151,45 +1183,99 @@ _DEFAULT_COPY = {
 }
 
 
-def _generate_compliment(business_name, city, notes):
-    """Generate a personalized compliment based on Google review data."""
+# Tier 3 fallback hooks by vertical — specialization + personable ending
+_VERTICAL_HOOKS = {
+    "Restaurants": "running a kitchen in {city} -- that's a competitive space to stand out in",
+    "Retail": "curating a solid product lineup in {city} -- that takes a real eye for it",
+    "Trades": "covering residential and commercial jobs in {city} -- that's not easy to pull off",
+    "Dental & Medical": "running a practice in {city} -- that kind of trust takes time to build",
+    "Salons & Spas": "building a clientele in {city} -- it's clear you take your craft seriously",
+    "Professional Services": "handling clients in {city} -- that takes real expertise",
+    "Fitness & Wellness": "building a fitness community in {city} -- that's not something you can fake",
+    "Auto Services": "keeping {city} drivers on the road -- that's the kind of work people rely on",
+    "Cleaning & Property": "keeping properties in {city} looking sharp -- that kind of consistency gets noticed",
+}
+_DEFAULT_HOOK = "really like what you've built"
+
+
+def _generate_hook(business_name, city, notes, vertical):
+    """
+    Generate a personalized hook using 3-tier system:
+      Tier 1: Google reviews (rating + count) — best, most specific
+      Tier 2: Years in business (7+ years from YP) — shows credibility
+      Tier 3: Specialization + personable ending per vertical — always available
+    Returns the hook string (everything after "I came across {business_name} in {city} -- ").
+    """
     stars = 0
     count = 0
+    years = 0
 
-    # Parse review data from notes field
     if notes:
+        # Parse review data
         star_match = re.search(r'(\d+\.?\d*)\s*stars?,\s*(\d+)\s*reviews?', notes)
         if star_match:
             stars = float(star_match.group(1))
             count = int(star_match.group(2))
+        # Parse years in business
+        years_match = re.search(r'(\d+)\s*(?:years?\s*in\s*business|yrs?\s*in\s*biz)', notes, re.I)
+        if years_match:
+            years = int(years_match.group(1))
 
-    if stars >= 4.5 and count >= 50:
-        return f"I came across {business_name} in {city} — {stars} stars across {count} reviews is no joke."
-    elif stars >= 4.5 and count > 0:
-        return f"I came across {business_name} in {city} — {stars} stars says a lot about how you run things."
-    elif stars >= 4.0 and count > 0:
-        return f"I came across {business_name} in {city} — your reviews speak for themselves."
-    elif stars > 0 and count > 0:
-        return f"I came across {business_name} in {city} — it's clear you've built something real."
-    else:
-        return f"I came across {business_name} in {city} — really like what you've built."
+    # Tier 1: Google reviews
+    if stars > 0 and count > 0:
+        if stars >= 4.5 and count >= 50:
+            hook = f"{stars} stars across {count} reviews is no joke"
+        elif count >= 100:
+            hook = f"{count} reviews and a {stars} rating -- that reputation is earned"
+        elif stars >= 4.5:
+            hook = f"{stars} stars says a lot about how you run things"
+        elif stars >= 4.0:
+            hook = "your reviews speak for themselves"
+        else:
+            hook = "it's clear you've built something real"
+        return f"I came across {business_name} in {city} -- {hook}."
+
+    # Tier 2: Years in business (7+ years)
+    if years >= 7:
+        if years >= 20:
+            hook = f"{years} years in the game speaks for itself"
+        elif years >= 15:
+            hook = f"been serving {city} for over {years} years -- that's no small thing"
+        else:
+            hook = f"{years} years in business says a lot"
+        return f"I came across {business_name} in {city} -- {hook}."
+
+    # Tier 3: Vertical-specific fallback
+    template = _VERTICAL_HOOKS.get(vertical, _DEFAULT_HOOK)
+    hook = template.format(city=city) if "{city}" in template else template
+    return f"I came across {business_name} in {city} -- {hook}."
 
 
 def generate_email(prospect):
     """
     Generate a personalized cold email for a prospect.
-    Returns dict with subject, body_html, body_text, or None if can't personalize.
+    Owner name is preferred but NOT required — uses "Hi there" fallback.
+    The ONLY hard filter is: must have an email address.
     """
-    owner = (prospect.get("owner") or "").strip()
-    if not owner:
+    email = (prospect.get("email") or "").strip()
+    if not email or "@" not in email:
         return None
 
-    first_name = owner.split()[0]
+    owner = (prospect.get("owner") or "").strip()
     business_name = prospect.get("name", "your business")
     vertical = prospect.get("cat", "")
     ai_gap = prospect.get("opp", "")
     address = prospect.get("address", "")
     notes = prospect.get("notes", "")
+
+    # Greeting: use owner first name if available, "Hi there" if not
+    if owner:
+        first_name = owner.split()[0]
+        greeting = f"Hi {first_name}"
+        to_name = first_name
+    else:
+        greeting = "Hi there"
+        to_name = business_name
 
     # Extract city
     city = "the GTA"
@@ -1200,25 +1286,20 @@ def generate_email(prospect):
         elif parts:
             city = parts[0].strip()
 
-    # Rotating subject lines (randomized per email)
-    subject_templates = [
-        f"{first_name}",
-        f"idea for {business_name}",
-        f"{first_name}, quick thought",
-    ]
-    subject = random.choice(subject_templates)
+    # Single subject line
+    subject = f"Quick question about {business_name}"
 
-    # Personalized compliment based on Google reviews
-    compliment = _generate_compliment(business_name, city, notes)
+    # 3-tier personalized hook (reviews -> years -> specialization)
+    hook = _generate_hook(business_name, city, notes, vertical)
 
-    # Industry-specific body copy
+    # Industry-specific body copy (9 verticals)
     copy = VERTICAL_COPY.get(vertical, _DEFAULT_COPY)
     pitch = copy["pitch"]
     consult = copy["consult"]
 
     body_text = (
-        f"Hi {first_name},\n\n"
-        f"{compliment}\n\n"
+        f"{greeting},\n\n"
+        f"{hook}\n\n"
         f"{pitch}\n\n"
         f"{consult}\n\n"
         f"Open to a quick chat? Reply here or text me at (647) 210-3737.\n\n"
@@ -1230,8 +1311,8 @@ def generate_email(prospect):
     )
 
     body_html = (
-        f"<p>Hi {first_name},</p>"
-        f"<p>{compliment}</p>"
+        f"<p>{greeting},</p>"
+        f"<p>{hook}</p>"
         f"<p>{pitch}</p>"
         f"<p>{consult}</p>"
         f"<p>Open to a quick chat? Reply here or text me at (647) 210-3737.</p>"
@@ -1244,8 +1325,8 @@ def generate_email(prospect):
     )
 
     return {
-        "to_email": prospect.get("email", ""),
-        "to_name": first_name,
+        "to_email": email,
+        "to_name": to_name,
         "subject": subject,
         "body_html": body_html,
         "body_text": body_text,
@@ -1266,7 +1347,7 @@ def run_draft(max_drafts=20, dry_run=False):
     4. Save drafts to Franco's Gmail inbox
     """
     print("=" * 60)
-    print("  Unify Cold Email Agent v4.0 — DRAFT MODE")
+    print("  Unify Cold Email Agent v5.0 -- DRAFT MODE")
     print("=" * 60)
     print(f"  Max drafts  : {max_drafts}")
     print(f"  Dry run     : {dry_run}")
@@ -1333,13 +1414,24 @@ def run_draft(max_drafts=20, dry_run=False):
         print(f"    Existing email: {existing_email or 'NONE'}")
         enrichment = enrich_prospect(name, city, website_url=website, existing_email=existing_email)
 
-        # Store review data regardless of owner name result
-        if enrichment["stars"] > 0 and not dry_run:
+        # Store enrichment data (reviews, years, specialization) in notes field
+        notes_additions = ""
+        if enrichment["stars"] > 0:
             review_note = f" | {enrichment['stars']} stars, {enrichment['review_count']} reviews"
             if review_note not in notes:
-                patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
-                requests.patch(patch_url, headers=sb_headers(),
-                    json={"notes": notes + review_note}, timeout=15)
+                notes_additions += review_note
+        if enrichment.get("years_in_business") and enrichment["years_in_business"] > 0:
+            years_note = f" | {enrichment['years_in_business']} years in business"
+            if "years in business" not in notes:
+                notes_additions += years_note
+        if enrichment.get("specialization"):
+            spec_note = f" | Specialization: {enrichment['specialization']}"
+            if "Specialization:" not in notes:
+                notes_additions += spec_note
+        if notes_additions and not dry_run:
+            patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
+            requests.patch(patch_url, headers=sb_headers(),
+                json={"notes": notes + notes_additions}, timeout=15)
 
         if enrichment["owner"]:
             enriched_count += 1
@@ -1386,10 +1478,11 @@ def run_draft(max_drafts=20, dry_run=False):
     print(f"    Google available         : {'Yes' if _is_google_available() else 'No (cooldown)'}")
 
     # =========================================================================
-    # PHASE 2: Draft emails for prospects with owner names
+    # PHASE 2: Draft emails for ALL prospects with email addresses
+    # Owner name preferred but not required — "Hi there" fallback
     # =========================================================================
     print("\n" + "-" * 60)
-    print("  PHASE 2: Drafting personalized cold emails")
+    print("  PHASE 2: Drafting cold emails (email = only hard filter)")
     print("-" * 60)
 
     prospects = get_prospects_to_email()
@@ -1497,7 +1590,7 @@ def run_draft(max_drafts=20, dry_run=False):
 def run_send(dry_run=False):
     """Send approved emails from agent_queue via Resend API."""
     print("=" * 60)
-    print("  Unify Cold Email Agent v4.0 — SEND MODE")
+    print("  Unify Cold Email Agent v5.0 -- SEND MODE")
     print("=" * 60)
     print(f"  Resend : {'Configured' if RESEND_API_KEY else 'No key'}")
     print(f"  Sender : {SENDER_EMAIL}")
@@ -1562,7 +1655,7 @@ def run_send(dry_run=False):
 # -- CLI ----------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Unify Cold Email Agent v4.0")
+    parser = argparse.ArgumentParser(description="Unify Cold Email Agent v5.0")
     parser.add_argument("--draft", action="store_true",
                         help="Enrich names + generate email drafts in Gmail")
     parser.add_argument("--send", action="store_true",
