@@ -195,7 +195,7 @@ def get_prospects_to_email(redraft=False):
     allowed_statuses = {"NOT CONTACTED", "PHONE CALL READY"} if redraft else {"NOT CONTACTED"}
     for p in all_prospects:
         email = (p.get("email") or "").strip().lower()
-        status = (p.get("status") or "").strip().upper()
+        status = (p.get("stage") or p.get("status") or "").strip().upper()
 
         # Email is the ONLY hard filter
         if not email or "@" not in email:
@@ -1661,8 +1661,8 @@ def run_draft(max_drafts=20, dry_run=False, redraft=False):
         # Move prospect from "Not Contacted" -> "Phone Call Ready"
         patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
         requests.patch(patch_url, headers=sb_headers(), json={
-            "status": "PHONE CALL READY",
-            "action": "Email drafted — review in Gmail, then call",
+            "stage": "Phone Call Ready",
+            "next_action": "Email drafted -- review in Gmail, then call",
         }, timeout=15)
 
         if gmail_ok:
