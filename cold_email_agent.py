@@ -191,22 +191,31 @@ def get_prospects_to_email(redraft=False):
     If redraft=True, also includes prospects already in PHONE CALL READY stage.
     """
     all_prospects = get_all_prospects()
+    print(f"  [DEBUG] Total prospects fetched: {len(all_prospects)}")
     ready = []
     allowed_statuses = {"NOT CONTACTED", "PHONE CALL READY"} if redraft else {"NOT CONTACTED"}
+    no_email = 0
+    wrong_status = 0
+    dead_end = 0
     for p in all_prospects:
         email = (p.get("email") or "").strip().lower()
-        status = (p.get("stage") or p.get("status") or "").strip().upper()
+        status = (p.get("status") or "").strip().upper()
 
         # Email is the ONLY hard filter
         if not email or "@" not in email:
+            no_email += 1
             continue
         # Skip dead-end addresses
         if any(email.startswith(d) for d in DEAD_END_EMAILS):
+            dead_end += 1
             continue
         if status not in allowed_statuses:
+            wrong_status += 1
             continue
 
         ready.append(p)
+    print(f"  [DEBUG] Skipped: {no_email} no email, {dead_end} dead-end, {wrong_status} wrong status")
+    print(f"  [DEBUG] Ready for drafting: {len(ready)}")
     return ready
 
 
@@ -1592,19 +1601,19 @@ def run_draft(max_drafts=20, dry_run=False, redraft=False):
 
     # If redraft, reset stages and clear old queue entries
     if redraft and not dry_run:
-        # Reset "Phone Call Ready" prospects back to "Not Contacted"
+        # Reset "PHONE CALL READY" prospects back to "NOT CONTACTED"
         reset_url = (
             f"{SUPABASE_URL}/rest/v1/prospects"
-            f"?stage=eq.Phone Call Ready"
+            f"?status=eq.PHONE CALL READY"
         )
         r = requests.patch(reset_url, headers=sb_headers(),
-                           json={"stage": "Not Contacted", "next_action": None},
+                           json={"status": "NOT CONTACTED", "action": None},
                            timeout=15)
         if r.status_code in (200, 204):
             reset_count = len(r.json()) if r.text.strip() else 0
-            print(f"  Reset {reset_count} prospects from Phone Call Ready -> Not Contacted")
+            print(f"  Reset {reset_count} prospects from PHONE CALL READY -> NOT CONTACTED")
         else:
-            print(f"  WARNING: Could not reset stages ({r.status_code})")
+            print(f"  WARNING: Could not reset stages ({r.status_code}: {r.text[:200]})")
         _clear_cold_email_queue()
 
     # Set up Gmail
@@ -1674,8 +1683,8 @@ def run_draft(max_drafts=20, dry_run=False, redraft=False):
         # Move prospect from "Not Contacted" -> "Phone Call Ready"
         patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
         requests.patch(patch_url, headers=sb_headers(), json={
-            "stage": "Phone Call Ready",
-            "next_action": "Email drafted -- review in Gmail, then call",
+            "status": "PHONE CALL READY",
+            "action": "Email drafted -- review in Gmail, then call",
         }, timeout=15)
 
         if gmail_ok:
