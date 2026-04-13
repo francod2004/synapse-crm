@@ -1,0 +1,35 @@
+name: Unify Enrichment (Local)
+
+on:
+  schedule:
+    - cron: '0 14,20 * * *'  # 10 AM + 4 PM EDT
+  workflow_dispatch:
+    inputs:
+      max:
+        description: 'Max prospects to enrich'
+        required: false
+        default: '50'
+
+jobs:
+  enrich:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml dnspython
+
+      - name: Run Enrichment
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          FRANCO_PHONE: ${{ secrets.FRANCO_PHONE }}
+        run: python cold_email_agent.py --enrich-only --max ${{ github.event.inputs.max || '50' }}

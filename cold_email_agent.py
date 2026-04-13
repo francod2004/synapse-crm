@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Unify Cold Email Agent v5.0
+Unify Cold Email Agent v5.1
 =============================
-1. Enriches CRM leads (owner names, emails, years in business, specialization)
-2. Drafts personalized cold emails using 3-tier hook + 9 vertical templates
-3. Saves drafts directly into Franco's Gmail for review and sending
-4. Owner name preferred but NOT required — "Hi there" fallback
+1. Enriches CRM leads (owner names, emails, websites, years in business)
+2. Constructs info@domain emails when no email found (MX verified)
+3. Drafts personalized cold emails using 3-tier hook + 9 vertical templates
+4. Flags missing website/email in CRM for Franco's visibility
 
-Two modes:
-  --draft  : Enrich leads + create Gmail drafts (runs daily, unattended)
-  --send   : Send all approved emails from agent_queue via Resend (manual)
+Three modes:
+  --enrich-only : Enrich leads only (self-hosted runner on Franco's PC)
+  --draft       : Create Gmail drafts from enriched data (GitHub Actions)
+  --send        : Send approved emails via Resend (manual trigger)
 
 RULE: Never send an email without Franco's explicit approval.
 Drafts go to Gmail for Franco to review, personalize, and send manually.
@@ -73,6 +74,9 @@ GENERIC_EMAILS = {
     "hello@", "support@", "sales@", "office@", "help@",
     "webmaster@", "mail@", "enquiries@", "inquiries@",
 }
+
+# Dead-end email prefixes — never worth emailing
+DEAD_END_EMAILS = {"noreply@", "no-reply@", "donotreply@", "do-not-reply@"}
 
 
 # -- Gmail Setup --------------------------------------------------------------
@@ -187,8 +191,6 @@ def get_prospects_to_email():
     """
     all_prospects = get_all_prospects()
     ready = []
-    # Dead-end email prefixes — never worth emailing
-    dead_ends = {"noreply@", "no-reply@", "donotreply@", "do-not-reply@"}
     for p in all_prospects:
         email = (p.get("email") or "").strip().lower()
         status = (p.get("status") or "").strip().upper()
@@ -197,7 +199,7 @@ def get_prospects_to_email():
         if not email or "@" not in email:
             continue
         # Skip dead-end addresses
-        if any(email.startswith(d) for d in dead_ends):
+        if any(email.startswith(d) for d in DEAD_END_EMAILS):
             continue
         if status != "NOT CONTACTED":
             continue
@@ -344,6 +346,30 @@ _SKIP_WEBSITE_DOMAINS = [
 _google_cooldown_until = 0
 
 
+def _extract_domain(url):
+    """Extract clean domain from a URL (strips protocol, www, path)."""
+    if not url:
+        return ""
+    cleaned = url.lower().replace("https://", "").replace("http://", "").replace("www.", "")
+    return cleaned.split("/")[0].strip()
+
+
+def _domain_has_mx(domain):
+    """Verify domain can receive email via MX record lookup."""
+    try:
+        import dns.resolver
+        answers = dns.resolver.resolve(domain, 'MX')
+        return len(answers) > 0
+    except Exception:
+        # If dnspython not installed or DNS fails, try basic resolution
+        try:
+            import socket
+            socket.getaddrinfo(domain, 25)
+            return True
+        except Exception:
+            return False
+
+
 def _is_google_available():
     return time.time() >= _google_cooldown_until
 
@@ -367,7 +393,7 @@ def enrich_prospect(business_name, city, website_url="", existing_email=""):
     result = {
         "owner": "", "source": "", "stars": 0,
         "review_count": 0, "personal_email": "", "found_email": "",
-        "years_in_business": 0, "specialization": "",
+        "years_in_business": 0, "specialization": "", "website": "",
     }
 
     # =========================================================================
@@ -393,7 +419,11 @@ def enrich_prospect(business_name, city, website_url="", existing_email=""):
         result["personal_email"] = _guess_owner_email(
             yp_result["owner"], existing_email, website_url
         )
-        return result
+        # Only skip website scraping if we already have an email
+        if result["found_email"] or result["personal_email"]:
+            result["website"] = website_url
+            return result
+        # else: fall through to website scraping for email
 
     # Even without owner, grab email + website from YP for later steps
     if yp_result.get("email") and not result["found_email"]:
@@ -455,8 +485,22 @@ def enrich_prospect(business_name, city, website_url="", existing_email=""):
                 result["owner"] = name
                 result["source"] = source_name
                 result["personal_email"] = _guess_owner_email(name, existing_email, website_url)
+                result["website"] = website_url
                 return result
 
+    # =========================================================================
+    # STEP 5: Domain-based email construction (last resort)
+    # If we have a website domain but still no email, construct info@domain
+    # =========================================================================
+    if not result["found_email"] and not existing_email and website_url:
+        domain = _extract_domain(website_url)
+        if domain and _domain_has_mx(domain):
+            result["found_email"] = f"info@{domain}"
+            print(f"     [Construct] info@{domain} (MX verified)")
+        elif domain:
+            print(f"     [Construct] {domain} has no MX records -- skipped")
+
+    result["website"] = website_url
     return result
 
 
@@ -541,12 +585,14 @@ def _scrape_website_for_owner_and_email(website_url, business_name):
         base = "https://" + base
 
     pages = [
+        base + "/contact",
+        base + "/contact-us",
         base + "/about",
         base + "/about-us",
         base + "/team",
         base + "/our-team",
-        base + "/contact",
-        base + "/contact-us",
+        base + "/staff",
+        base + "/people",
         base,  # homepage fallback
     ]
 
@@ -573,6 +619,19 @@ def _scrape_website_for_owner_and_email(website_url, business_name):
                 email = match.group(0).lower().rstrip(".")
                 if email not in found_emails and not email.endswith((".png", ".jpg", ".gif")):
                     found_emails.append(email)
+
+            # Footer-specific email extraction (many small biz sites only show email in footer)
+            if not found_emails:
+                footer = soup.select_one("footer, [class*='footer'], [id*='footer']")
+                if footer:
+                    for mailto in footer.select("a[href^='mailto:']"):
+                        email = mailto.get("href", "").replace("mailto:", "").split("?")[0].strip().lower()
+                        if email and "@" in email and email not in found_emails:
+                            found_emails.append(email)
+                    for match in re.finditer(r'[\w.+-]+@[\w-]+\.[\w.-]+', footer.get_text(" ", strip=True)):
+                        email = match.group(0).lower().rstrip(".")
+                        if email not in found_emails and not email.endswith((".png", ".jpg", ".gif")):
+                            found_emails.append(email)
 
             # --- Scrape owner name ---
             if not found_owner:
@@ -1303,11 +1362,10 @@ def generate_email(prospect):
         f"{pitch}\n\n"
         f"{consult}\n\n"
         f"Open to a quick chat? Reply here or text me at (647) 210-3737.\n\n"
+        f"Look forward to hearing from you.\n\n"
         f"Franco Di Giovanni\n"
         f"Unify AI Partners\n"
-        f"franco@unifyaipartners.ca\n\n"
-        f"---\n"
-        f"If you'd prefer not to hear from us, just reply with 'unsubscribe'."
+        f"franco@unifyaipartners.ca"
     )
 
     body_html = (
@@ -1316,12 +1374,10 @@ def generate_email(prospect):
         f"<p>{pitch}</p>"
         f"<p>{consult}</p>"
         f"<p>Open to a quick chat? Reply here or text me at (647) 210-3737.</p>"
+        f"<p>Look forward to hearing from you.</p>"
         f"<p>Franco Di Giovanni<br>"
         f"<strong>Unify AI Partners</strong><br>"
         f"<a href='mailto:franco@unifyaipartners.ca'>franco@unifyaipartners.ca</a></p>"
-        f"<hr style='border:none;border-top:1px solid #ddd;margin-top:20px'>"
-        f"<p style='font-size:11px;color:#999'>If you'd prefer not to hear from us, "
-        f"just reply with 'unsubscribe'.</p>"
     )
 
     return {
@@ -1339,37 +1395,19 @@ def generate_email(prospect):
 # DRAFT MODE — Main workflow
 # ==============================================================================
 
-def run_draft(max_drafts=20, dry_run=False):
+def run_enrich(max_enrich=50, dry_run=False):
     """
-    1. Search entire CRM for leads without owner names
-    2. Enrich via LinkedIn + Facebook Google search
-    3. Draft personalized emails per industry
-    4. Save drafts to Franco's Gmail inbox
+    ENRICHMENT ONLY — for self-hosted runner on Franco's PC.
+    Enriches prospects missing owner name, email, or website.
+    Does NOT draft emails or touch Gmail.
     """
     print("=" * 60)
-    print("  Unify Cold Email Agent v5.0 -- DRAFT MODE")
+    print("  Unify Cold Email Agent v5.1 -- ENRICH MODE")
     print("=" * 60)
-    print(f"  Max drafts  : {max_drafts}")
+    print(f"  Max enrich  : {max_enrich}")
     print(f"  Dry run     : {dry_run}")
     print(f"  Supabase    : {'Connected' if SUPABASE_KEY else 'No key'}")
-    print(f"  Gmail       : Checking...")
     print()
-
-    # Set up Gmail
-    gmail = None
-    if not dry_run:
-        gmail = get_gmail_service()
-        if gmail:
-            print("  Gmail       : Connected")
-        else:
-            print("  Gmail       : NOT connected -- drafts will only go to agent_queue")
-
-    # =========================================================================
-    # PHASE 1: Enrich leads missing owner names OR emails
-    # =========================================================================
-    print("\n" + "-" * 60)
-    print("  PHASE 1: Enriching leads (missing owner name or email)")
-    print("-" * 60)
 
     needs_enrichment = get_prospects_needing_enrichment()
     has_owner_no_email = len([p for p in needs_enrichment if (p.get("owner") or "").strip() and not (p.get("email") or "").strip()])
@@ -1377,29 +1415,28 @@ def run_draft(max_drafts=20, dry_run=False):
     print(f"  Found {len(needs_enrichment)} prospects needing enrichment")
     print(f"    - {no_owner} missing owner name")
     print(f"    - {has_owner_no_email} have owner but missing email")
+    print(f"  Enriching up to {max_enrich} prospects this run")
 
     enriched_count = 0
-    source_counts = {}  # Track which sources find names
+    emails_found = 0
+    websites_found = 0
+    no_website_flagged = 0
+    no_email_flagged = 0
+    source_counts = {}
 
-    # Cap enrichment to max_drafts * 2 to keep runs fast
-    enrich_limit = max_drafts * 2
-    print(f"  Enriching up to {enrich_limit} prospects this run")
-
-    for prospect in needs_enrichment[:enrich_limit]:
+    for i, prospect in enumerate(needs_enrichment[:max_enrich]):
         pid = prospect.get("id", "unknown")
         name = prospect.get("name", "Unknown")
         address = prospect.get("address", "")
         existing_email = prospect.get("email", "")
-        website = prospect.get("website", "") or ""  # website URL from lead sourcer
+        website = prospect.get("website", "") or ""
 
-        # Fallback: try to extract URL from notes field
         notes = prospect.get("notes", "") or ""
         if not website:
             url_match = re.search(r'https?://[^\s]+', notes)
             if url_match:
                 website = url_match.group(0)
 
-        # Extract city for search
         city = "Toronto"
         if address:
             parts = address.split(",")
@@ -1408,7 +1445,7 @@ def run_draft(max_drafts=20, dry_run=False):
             elif parts:
                 city = parts[0].strip()
 
-        print(f"\n  [{needs_enrichment.index(prospect)+1}/{min(len(needs_enrichment), enrich_limit)}] "
+        print(f"\n  [{i+1}/{min(len(needs_enrichment), max_enrich)}] "
               f"Enriching: {name} ({city})")
         print(f"    Website URL: {website or 'NONE'}")
         print(f"    Existing email: {existing_email or 'NONE'}")
@@ -1428,10 +1465,33 @@ def run_draft(max_drafts=20, dry_run=False):
             spec_note = f" | Specialization: {enrichment['specialization']}"
             if "Specialization:" not in notes:
                 notes_additions += spec_note
+
+        # Flag no website found -- low digital presence (Change 8)
+        if not enrichment.get("website") and not website:
+            if "No website found" not in notes:
+                notes_additions += " | No website found -- low digital presence"
+                no_website_flagged += 1
+                print(f"    Flagged: no website found (low digital presence)")
+
+        # Flag no email found (Change 9)
+        if not enrichment.get("found_email") and not existing_email:
+            if "No email found" not in notes:
+                notes_additions += " | No email found"
+                no_email_flagged += 1
+                print(f"    Flagged: no email found")
+
         if notes_additions and not dry_run:
             patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
             requests.patch(patch_url, headers=sb_headers(),
                 json={"notes": notes + notes_additions}, timeout=15)
+
+        # Store discovered website URL (Change 2)
+        if enrichment.get("website") and not website and not dry_run:
+            patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
+            requests.patch(patch_url, headers=sb_headers(),
+                json={"website": enrichment["website"]}, timeout=15)
+            websites_found += 1
+            print(f"    Website stored: {enrichment['website']}")
 
         if enrichment["owner"]:
             enriched_count += 1
@@ -1440,49 +1500,91 @@ def run_draft(max_drafts=20, dry_run=False):
 
             print(f"    Found: {enrichment['owner']} via {src}")
             if not dry_run:
-                update_data = {"owner": enrichment["owner"], "action": "Ready for cold email"}
-                # If we found a personal email, upgrade their email field
+                update_data = {"owner": enrichment["owner"]}
                 if enrichment["personal_email"]:
                     update_data["email"] = enrichment["personal_email"]
+                    emails_found += 1
                     print(f"    Personal email: {enrichment['personal_email']}")
-                # If we found an email on the website but no personal email, still use it
                 elif enrichment.get("found_email") and not existing_email:
                     update_data["email"] = enrichment["found_email"]
-                    print(f"    Website email: {enrichment['found_email']}")
+                    emails_found += 1
+                    print(f"    Email: {enrichment['found_email']}")
                 patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
                 requests.patch(patch_url, headers=sb_headers(),
                     json=update_data, timeout=15)
         else:
-            # Even without owner, store any email we found
             if enrichment.get("found_email") and not existing_email and not dry_run:
                 patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
                 requests.patch(patch_url, headers=sb_headers(),
                     json={"email": enrichment["found_email"]}, timeout=15)
+                emails_found += 1
                 print(f"    No owner, but found email: {enrichment['found_email']}")
+            elif not enrichment.get("found_email") and not existing_email:
+                print(f"    No owner or email found")
             else:
                 print(f"    No owner found")
 
-        # Rate limit between searches
         time.sleep(random.uniform(2, 4))
 
     source_summary = ", ".join(f"{v} {k}" for k, v in sorted(source_counts.items(), key=lambda x: -x[1]))
-    attempted = min(len(needs_enrichment), enrich_limit)
+    attempted = min(len(needs_enrichment), max_enrich)
     print(f"\n  {'='*56}")
     print(f"  ENRICHMENT SUMMARY")
     print(f"  {'='*56}")
     print(f"    Total needing enrichment : {len(needs_enrichment)}")
     print(f"    Attempted this run       : {attempted}")
     print(f"    Owner names found        : {enriched_count}")
-    print(f"    Success rate             : {enriched_count}/{attempted} ({(enriched_count*100//attempted) if attempted else 0}%)")
+    print(f"    Emails found/constructed : {emails_found}")
+    print(f"    Websites discovered      : {websites_found}")
+    print(f"    Flagged no website       : {no_website_flagged}")
+    print(f"    Flagged no email         : {no_email_flagged}")
     print(f"    Sources breakdown        : {source_summary or 'none'}")
     print(f"    Google available         : {'Yes' if _is_google_available() else 'No (cooldown)'}")
 
+    msg = (
+        f"Unify Enrichment: {attempted} prospects processed. "
+        f"{enriched_count} owners, {emails_found} emails found, "
+        f"{websites_found} websites discovered. "
+        f"{no_website_flagged} flagged no website, {no_email_flagged} flagged no email."
+    )
+    print(f"\n  Notifying Franco...")
+    if not dry_run:
+        send_sms(msg)
+    else:
+        print(f"  [DRY RUN] SMS: {msg}")
+
+    print("\n  Done.")
+
+
+def run_draft(max_drafts=20, dry_run=False):
+    """
+    DRAFT MODE — generates email drafts from already-enriched data.
+    Does NOT run enrichment. Use --enrich-only for that.
+    """
+    print("=" * 60)
+    print("  Unify Cold Email Agent v5.1 -- DRAFT MODE")
+    print("=" * 60)
+    print(f"  Max drafts  : {max_drafts}")
+    print(f"  Dry run     : {dry_run}")
+    print(f"  Supabase    : {'Connected' if SUPABASE_KEY else 'No key'}")
+    print(f"  Gmail       : Checking...")
+    print()
+
+    # Set up Gmail
+    gmail = None
+    if not dry_run:
+        gmail = get_gmail_service()
+        if gmail:
+            print("  Gmail       : Connected")
+        else:
+            print("  Gmail       : NOT connected -- drafts will only go to agent_queue")
+
     # =========================================================================
-    # PHASE 2: Draft emails for ALL prospects with email addresses
+    # Draft emails for ALL prospects with email addresses
     # Owner name preferred but not required — "Hi there" fallback
     # =========================================================================
     print("\n" + "-" * 60)
-    print("  PHASE 2: Drafting cold emails (email = only hard filter)")
+    print("  Drafting cold emails (email = only hard filter)")
     print("-" * 60)
 
     prospects = get_prospects_to_email()
@@ -1549,9 +1651,8 @@ def run_draft(max_drafts=20, dry_run=False):
     # SUMMARY + SMS
     # =========================================================================
     print("\n" + "=" * 60)
-    print(f"  Unify Cold Email Agent — Draft Complete")
+    print(f"  Unify Cold Email Agent -- Draft Complete")
     print(f"  {'='*56}")
-    print(f"     Names enriched     : {enriched_count} ({source_summary or 'none'})")
     print(f"     Email drafts       : {drafted}")
     print(f"     Saved to Gmail     : {'Yes' if gmail else 'No (token missing)'}")
     print("=" * 60)
@@ -1559,19 +1660,12 @@ def run_draft(max_drafts=20, dry_run=False):
     if drafted > 0:
         msg = (
             f"Unify: {drafted} new leads ready to be called. "
-            f"Emails drafted in your Gmail — review, send, and call. "
-            f"Enriched {enriched_count} owner names this run."
-        )
-    elif enriched_count > 0:
-        msg = (
-            f"Unify: Enriched {enriched_count} owner names, "
-            f"0 new drafts this run (no prospects with email + owner ready). "
-            f"Leads are building — more coming soon."
+            f"Emails drafted in your Gmail -- review, send, and call."
         )
     else:
         msg = (
-            f"Unify: No new leads to call right now. "
-            f"0 drafts, 0 enriched this run. All caught up."
+            f"Unify: 0 new drafts this run. "
+            f"All prospects either already drafted or no email available."
         )
 
     print(f"\n  Notifying Franco...")
@@ -1590,7 +1684,7 @@ def run_draft(max_drafts=20, dry_run=False):
 def run_send(dry_run=False):
     """Send approved emails from agent_queue via Resend API."""
     print("=" * 60)
-    print("  Unify Cold Email Agent v5.0 -- SEND MODE")
+    print("  Unify Cold Email Agent v5.1 -- SEND MODE")
     print("=" * 60)
     print(f"  Resend : {'Configured' if RESEND_API_KEY else 'No key'}")
     print(f"  Sender : {SENDER_EMAIL}")
@@ -1655,23 +1749,27 @@ def run_send(dry_run=False):
 # -- CLI ----------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Unify Cold Email Agent v5.0")
+    parser = argparse.ArgumentParser(description="Unify Cold Email Agent v5.1")
     parser.add_argument("--draft", action="store_true",
-                        help="Enrich names + generate email drafts in Gmail")
+                        help="Generate email drafts in Gmail (no enrichment)")
     parser.add_argument("--send", action="store_true",
                         help="Send approved emails via Resend")
+    parser.add_argument("--enrich-only", action="store_true",
+                        help="Run enrichment only (for self-hosted runner)")
     parser.add_argument("--max", "-m", type=int, default=20,
-                        help="Max drafts per run (default: 20)")
+                        help="Max items per run (default: 20)")
     parser.add_argument("--dry-run", "-d", action="store_true",
                         help="Preview without writing to DB, Gmail, or sending")
     args = parser.parse_args()
 
-    if not args.draft and not args.send:
-        print("Error: Must specify --draft or --send")
+    if not args.draft and not args.send and not args.enrich_only:
+        print("Error: Must specify --draft, --send, or --enrich-only")
         parser.print_help()
         sys.exit(1)
 
-    if args.draft:
+    if args.enrich_only:
+        run_enrich(max_enrich=args.max, dry_run=args.dry_run)
+    elif args.draft:
         run_draft(max_drafts=args.max, dry_run=args.dry_run)
     elif args.send:
         run_send(dry_run=args.dry_run)
