@@ -167,9 +167,16 @@ def get_all_prospects():
 
 
 def get_prospects_needing_enrichment():
-    """Fetch prospects that have no owner name."""
+    """Fetch prospects that need enrichment — no owner name OR no email."""
     all_prospects = get_all_prospects()
-    return [p for p in all_prospects if not (p.get("owner") or "").strip()]
+    needs = []
+    for p in all_prospects:
+        has_owner = bool((p.get("owner") or "").strip())
+        has_email = bool((p.get("email") or "").strip())
+        # Need enrichment if missing owner OR missing email
+        if not has_owner or not has_email:
+            needs.append(p)
+    return needs
 
 
 def get_prospects_to_email():
@@ -324,6 +331,14 @@ _TITLE_KEYWORDS = (
     r"Owner|Founder|Proprietor|President|CEO|Principal|Director|"
     r"Manager|Partner|Operator"
 )
+
+# Domains to skip when extracting business websites from YP listings
+_SKIP_WEBSITE_DOMAINS = [
+    "yellowpages.ca", "pagesjaunes.ca", "yp.ca", "ypcdn",
+    "facebook.com", "instagram.com", "twitter.com", "x.com",
+    "google.com", "yelp.com", "bbb.org", "411.ca", "canada411",
+    "linkedin.com", "tiktok.com", "pinterest.com", "youtube.com",
+]
 
 # Google cooldown (recoverable, not permanent)
 _google_cooldown_until = 0
@@ -649,8 +664,8 @@ def _scrape_yellowpages_owner(business_name, city):
             listings = soup.select("div.resultList div, div.result")
 
         detail_url = ""
-        best_listing = None
-        for listing in listings[:5]:
+        for listing in listings[:10]:
+            # Get listing name — try text from multiple elements
             name_el = listing.select_one(
                 "a.listing__name--link, h3.listing__name, "
                 "a[class*='listing__name'], span.listing__name, h2 a, h3 a"
@@ -659,7 +674,12 @@ def _scrape_yellowpages_owner(business_name, city):
                 continue
             listed_name = name_el.get_text(strip=True).lower()
             biz_lower = business_name.lower()
-            # Flexible matching: first significant word, first 8 chars, or mutual containment
+
+            # Strip leading "1" prefix from lead sourcer artifacts
+            if biz_lower.startswith("1") and not biz_lower[1:2].isdigit():
+                biz_lower = biz_lower[1:]
+
+            # Flexible matching
             first_word = biz_lower.split()[0] if biz_lower.split() else ""
             match = (
                 biz_lower[:8] in listed_name
@@ -668,15 +688,31 @@ def _scrape_yellowpages_owner(business_name, city):
                 or listed_name in biz_lower
             )
             if match:
-                href = name_el.get("href", "")
-                if href and not href.startswith("http"):
-                    href = "https://www.yellowpages.ca" + href
-                detail_url = href
+                # Get detail link — may be on a child <a>, not on name_el itself
+                link_el = listing.select_one("a.listing__name--link, a[href*='/bus/']")
+                if link_el:
+                    href = link_el.get("href", "")
+                    if href and not href.startswith("http"):
+                        href = "https://www.yellowpages.ca" + href
+                    detail_url = href
 
-                # Grab website from listing
-                web_el = listing.select_one("a[class*='website'], a[data-analytics='website']")
-                if web_el:
-                    result["website"] = web_el.get("href", "")
+                # Grab website from listing — YP uses /gourl/ redirect links
+                for a in listing.select("a[href*='/gourl/']"):
+                    href = a.get("href", "")
+                    if "redirect=" in href:
+                        from urllib.parse import unquote
+                        actual = unquote(href.split("redirect=")[1].split("&")[0])
+                        if actual.startswith("http") and not any(d in actual.lower() for d in _SKIP_WEBSITE_DOMAINS):
+                            result["website"] = actual
+                            break
+                if not result["website"]:
+                    web_el = listing.select_one(
+                        "a[class*='website'], a[data-analytics='website']"
+                    )
+                    if web_el:
+                        href = web_el.get("href", "")
+                        if not any(d in href.lower() for d in _SKIP_WEBSITE_DOMAINS):
+                            result["website"] = href
 
                 # Grab email from listing
                 email_el = listing.select_one("a[href^='mailto:']")
@@ -721,11 +757,20 @@ def _scrape_yellowpages_owner(business_name, city):
                     if email_match:
                         result["email"] = email_match.group(0).lower().rstrip(".")
 
-            # Grab website if not found yet
+            # Grab website if not found yet — check /gourl/ redirects first
+            if not result["website"]:
+                for a in detail_soup.select("a[href*='/gourl/']"):
+                    href = a.get("href", "")
+                    if "redirect=" in href:
+                        from urllib.parse import unquote
+                        actual = unquote(href.split("redirect=")[1].split("&")[0])
+                        if actual.startswith("http") and not any(d in actual.lower() for d in _SKIP_WEBSITE_DOMAINS):
+                            result["website"] = actual
+                            break
             if not result["website"]:
                 for a in detail_soup.select("a[href^='http']"):
                     href = a.get("href", "")
-                    if "yellowpages.ca" not in href and "ypcdn" not in href:
+                    if not any(d in href.lower() for d in _SKIP_WEBSITE_DOMAINS):
                         result["website"] = href
                         break
 
@@ -911,7 +956,7 @@ def _normalize_name(name):
     if not name:
         return name
     if name.isupper() or name.islower():
-        # Handle hyphenated names: JEAN-PIERRE → Jean-Pierre
+        # Handle hyphenated names: JEAN-PIERRE -> Jean-Pierre
         return "-".join(part.capitalize() for part in name.split("-"))  \
             if "-" in name else name.title()
     return name
@@ -933,8 +978,12 @@ def _is_valid_person_name(name):
         "privacy policy", "terms service", "google maps",
         "google reviews", "view more", "see more", "show more",
         "north york", "east york", "west toronto", "south etobicoke",
-        "better business", "yellow pages", "white pages",
+        "better business", "yellow pages", "white pages", "pages jaunes",
         "all rights", "click here", "find out", "get started",
+        "of this business", "this business", "claim this", "claim your",
+        "write a review", "report this", "is this your",
+        "and operator", "and founder", "and manager", "and owner",
+        "and principal", "and president", "and director",
     }
     if normalized.lower() in false_positives_lower:
         return False
@@ -1235,14 +1284,18 @@ def run_draft(max_drafts=20, dry_run=False):
             print("  Gmail       : NOT connected -- drafts will only go to agent_queue")
 
     # =========================================================================
-    # PHASE 1: Enrich all leads missing owner names
+    # PHASE 1: Enrich leads missing owner names OR emails
     # =========================================================================
     print("\n" + "-" * 60)
-    print("  PHASE 1: Enriching leads without owner names")
+    print("  PHASE 1: Enriching leads (missing owner name or email)")
     print("-" * 60)
 
     needs_enrichment = get_prospects_needing_enrichment()
-    print(f"  Found {len(needs_enrichment)} prospects without owner names")
+    has_owner_no_email = len([p for p in needs_enrichment if (p.get("owner") or "").strip() and not (p.get("email") or "").strip()])
+    no_owner = len([p for p in needs_enrichment if not (p.get("owner") or "").strip()])
+    print(f"  Found {len(needs_enrichment)} prospects needing enrichment")
+    print(f"    - {no_owner} missing owner name")
+    print(f"    - {has_owner_no_email} have owner but missing email")
 
     enriched_count = 0
     source_counts = {}  # Track which sources find names
@@ -1385,7 +1438,7 @@ def run_draft(max_drafts=20, dry_run=False):
         # Also save to agent_queue for tracking
         insert_draft_to_queue(pid, email_data)
 
-        # Move prospect from "Not Contacted" → "Phone Call Ready"
+        # Move prospect from "Not Contacted" -> "Phone Call Ready"
         patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
         requests.patch(patch_url, headers=sb_headers(), json={
             "status": "PHONE CALL READY",
@@ -1394,10 +1447,10 @@ def run_draft(max_drafts=20, dry_run=False):
 
         if gmail_ok:
             drafted += 1
-            print(f"    Saved to Gmail + queue — status → Phone Call Ready")
+            print(f"    Saved to Gmail + queue — status -> Phone Call Ready")
         else:
             drafted += 1
-            print(f"    Saved to queue — status → Phone Call Ready (Gmail unavailable)")
+            print(f"    Saved to queue — status -> Phone Call Ready (Gmail unavailable)")
 
     # =========================================================================
     # SUMMARY + SMS
