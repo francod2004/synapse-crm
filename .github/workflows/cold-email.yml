@@ -12,6 +12,7 @@ on:
         type: choice
         options:
           - draft
+          - redraft
           - send
       max:
         description: 'Max prospects to process'

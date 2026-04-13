@@ -1242,19 +1242,20 @@ _DEFAULT_COPY = {
 }
 
 
-# Tier 3 fallback hooks by vertical — specialization + personable ending
+# Tier 3 value-driven hooks by vertical — hint at a pain point, create curiosity
+# These are COMPLETE opening lines (not fragments) to avoid generic "I came across X" formula
 _VERTICAL_HOOKS = {
-    "Restaurants": "running a kitchen in {city} -- that's a competitive space to stand out in",
-    "Retail": "curating a solid product lineup in {city} -- that takes a real eye for it",
-    "Trades": "covering residential and commercial jobs in {city} -- that's not easy to pull off",
-    "Dental & Medical": "running a practice in {city} -- that kind of trust takes time to build",
-    "Salons & Spas": "building a clientele in {city} -- it's clear you take your craft seriously",
-    "Professional Services": "handling clients in {city} -- that takes real expertise",
-    "Fitness & Wellness": "building a fitness community in {city} -- that's not something you can fake",
-    "Auto Services": "keeping {city} drivers on the road -- that's the kind of work people rely on",
-    "Cleaning & Property": "keeping properties in {city} looking sharp -- that kind of consistency gets noticed",
+    "Restaurants": "I was checking out {business_name} and had a quick idea about keeping tables full without relying on word of mouth alone.",
+    "Retail": "I was looking into {business_name} and had a thought on turning more foot traffic into repeat customers.",
+    "Trades": "I came across {business_name} and had a quick idea about keeping your schedule booked without chasing leads.",
+    "Dental & Medical": "I was looking into {business_name} and had an idea about keeping your appointment book full with less front-desk effort.",
+    "Salons & Spas": "I came across {business_name} and had a quick idea about keeping your chair booked and clients coming back.",
+    "Professional Services": "I was looking into {business_name} and had a thought about freeing up hours you're probably spending on admin and follow-ups.",
+    "Fitness & Wellness": "I came across {business_name} and had an idea about boosting member retention without adding to your plate.",
+    "Auto Services": "I was looking into {business_name} and had a quick idea about keeping your bays full without relying on drive-bys.",
+    "Cleaning & Property": "I came across {business_name} and had a thought about locking in more recurring contracts without cold calling.",
 }
-_DEFAULT_HOOK = "really like what you've built"
+_DEFAULT_HOOK = "I came across {business_name} in {city} and had a quick idea I wanted to share."
 
 
 def _generate_hook(business_name, city, notes, vertical):
@@ -1304,10 +1305,9 @@ def _generate_hook(business_name, city, notes, vertical):
             hook = f"{years} years in business says a lot"
         return f"I came across {business_name} in {city} -- {hook}."
 
-    # Tier 3: Vertical-specific fallback
+    # Tier 3: Vertical-specific value hook (complete opening line)
     template = _VERTICAL_HOOKS.get(vertical, _DEFAULT_HOOK)
-    hook = template.format(city=city) if "{city}" in template else template
-    return f"I came across {business_name} in {city} -- {hook}."
+    return template.format(business_name=business_name, city=city)
 
 
 def generate_email(prospect):
@@ -1556,19 +1556,41 @@ def run_enrich(max_enrich=50, dry_run=False):
     print("\n  Done.")
 
 
-def run_draft(max_drafts=20, dry_run=False):
+def _clear_cold_email_queue():
+    """Delete all cold_email entries from agent_queue so drafts can be regenerated."""
+    url = (
+        f"{SUPABASE_URL}/rest/v1/agent_queue"
+        f"?action_type=eq.cold_email"
+    )
+    r = requests.delete(url, headers=sb_headers(), timeout=15)
+    if r.status_code in (200, 204):
+        print("  Cleared old cold_email entries from agent_queue")
+        return True
+    else:
+        print(f"  WARNING: Could not clear agent_queue ({r.status_code})")
+        return False
+
+
+def run_draft(max_drafts=20, dry_run=False, redraft=False):
     """
     DRAFT MODE — generates email drafts from already-enriched data.
     Does NOT run enrichment. Use --enrich-only for that.
+    If redraft=True, clears old queue entries and regenerates all drafts.
     """
+    mode_label = "REDRAFT MODE" if redraft else "DRAFT MODE"
     print("=" * 60)
-    print("  Unify Cold Email Agent v5.1 -- DRAFT MODE")
+    print(f"  Unify Cold Email Agent v5.1 -- {mode_label}")
     print("=" * 60)
     print(f"  Max drafts  : {max_drafts}")
     print(f"  Dry run     : {dry_run}")
+    print(f"  Redraft     : {redraft}")
     print(f"  Supabase    : {'Connected' if SUPABASE_KEY else 'No key'}")
     print(f"  Gmail       : Checking...")
     print()
+
+    # If redraft, clear old queue entries first
+    if redraft and not dry_run:
+        _clear_cold_email_queue()
 
     # Set up Gmail
     gmail = None
@@ -1588,8 +1610,9 @@ def run_draft(max_drafts=20, dry_run=False):
     print("-" * 60)
 
     prospects = get_prospects_to_email()
-    existing_ids = get_existing_queue_ids()
-    prospects = [p for p in prospects if p.get("id") not in existing_ids]
+    if not redraft:
+        existing_ids = get_existing_queue_ids()
+        prospects = [p for p in prospects if p.get("id") not in existing_ids]
 
     print(f"  {len(prospects)} prospects ready for email drafts")
 
@@ -1752,6 +1775,8 @@ def main():
     parser = argparse.ArgumentParser(description="Unify Cold Email Agent v5.1")
     parser.add_argument("--draft", action="store_true",
                         help="Generate email drafts in Gmail (no enrichment)")
+    parser.add_argument("--redraft", action="store_true",
+                        help="Clear old drafts from queue and regenerate all emails")
     parser.add_argument("--send", action="store_true",
                         help="Send approved emails via Resend")
     parser.add_argument("--enrich-only", action="store_true",
@@ -1762,13 +1787,15 @@ def main():
                         help="Preview without writing to DB, Gmail, or sending")
     args = parser.parse_args()
 
-    if not args.draft and not args.send and not args.enrich_only:
-        print("Error: Must specify --draft, --send, or --enrich-only")
+    if not args.draft and not args.send and not args.enrich_only and not args.redraft:
+        print("Error: Must specify --draft, --redraft, --send, or --enrich-only")
         parser.print_help()
         sys.exit(1)
 
     if args.enrich_only:
         run_enrich(max_enrich=args.max, dry_run=args.dry_run)
+    elif args.redraft:
+        run_draft(max_drafts=args.max, dry_run=args.dry_run, redraft=True)
     elif args.draft:
         run_draft(max_drafts=args.max, dry_run=args.dry_run)
     elif args.send:
