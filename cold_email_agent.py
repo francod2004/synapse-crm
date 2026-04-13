@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unify Cold Email Agent v3.0
+Unify Cold Email Agent v4.0
 =============================
 1. Searches entire CRM for leads missing owner/manager names
 2. Cross-references Facebook + LinkedIn via Google to find names & titles
@@ -186,11 +186,11 @@ def get_prospects_to_email():
         email = (p.get("email") or "").strip().lower()
         status = (p.get("status") or "").strip().upper()
 
+        # Owner name is the ONLY hard filter — no name = can't personalize
         if not owner:
             continue
+        # Must have some email (generic like info@ is fine if we have a name)
         if not email or "@" not in email:
-            continue
-        if any(email.startswith(prefix) for prefix in GENERIC_EMAILS):
             continue
         if status != "NOT CONTACTED":
             continue
@@ -314,93 +314,147 @@ def send_email_via_resend(to_email, to_name, subject, body_html, body_text):
 
 
 # ==============================================================================
-# ENRICHMENT: Find owner names + personal emails via multiple sources
+# ENRICHMENT v4 — Datacenter-safe sources (no Google dependency)
 # ==============================================================================
 
-# Track Google rate-limit state across all enrichment calls
-_google_blocked = False
+# Flexible name patterns — handles accented, hyphenated, ALL-CAPS names
+_NAME_WORD = r"[A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F'\-]*"
+_FULL_NAME = _NAME_WORD + r"(?:\s+" + _NAME_WORD + r")+"
+_TITLE_KEYWORDS = (
+    r"Owner|Founder|Proprietor|President|CEO|Principal|Director|"
+    r"Manager|Partner|Operator"
+)
+
+# Google cooldown (recoverable, not permanent)
+_google_cooldown_until = 0
+
+
+def _is_google_available():
+    return time.time() >= _google_cooldown_until
+
+
+def _set_google_cooldown(seconds=300):
+    global _google_cooldown_until
+    _google_cooldown_until = time.time() + seconds
+    print(f"     [Google] Cooldown set for {seconds}s")
 
 
 def enrich_prospect(business_name, city, website_url="", existing_email=""):
     """
-    Full enrichment pipeline — tries 6 sources in priority order:
-      1. Google knowledge panel (fastest, often has owner name)
-      2. Business website About/Team page
-      3. LinkedIn via Google search
-      4. Facebook via Google search
-      5. Instagram via Google search
-      6. BBB via Google search
-    Also scrapes Google reviews for compliment personalization.
-    If owner found + business domain known, constructs likely personal email.
-    Returns dict: {owner, source, stars, review_count, personal_email}
+    Full enrichment pipeline — datacenter-safe sources FIRST:
+      1. Business website About/Team/Contact pages (+ email scraping)
+      2. YellowPages.ca detail page (proven from GitHub Actions)
+      3. Canada411 business listing (proven from GitHub Actions)
+      4. Google panel (fallback — only if not rate limited)
+      5. LinkedIn via Google (fallback)
+      6. Facebook via Google (fallback)
+    Returns dict: {owner, source, stars, review_count, personal_email, found_email}
     """
-    global _google_blocked
     result = {
         "owner": "", "source": "", "stars": 0,
-        "review_count": 0, "personal_email": "",
+        "review_count": 0, "personal_email": "", "found_email": "",
     }
 
-    # Get Google reviews/stars (also checks knowledge panel for owner)
-    stars, count, panel_owner = _scrape_google_panel(business_name, city)
-    result["stars"] = stars
-    result["review_count"] = count
+    # --- Try Google for reviews only (non-critical, graceful fail) ---
+    if _is_google_available():
+        stars, count, panel_owner = _scrape_google_panel(business_name, city)
+        result["stars"] = stars
+        result["review_count"] = count
+        if panel_owner:
+            result["owner"] = panel_owner
+            result["source"] = "Google"
+            result["personal_email"] = _guess_owner_email(panel_owner, existing_email, website_url)
+            return result
 
-    if panel_owner:
-        result["owner"] = panel_owner
-        result["source"] = "Google"
-        result["personal_email"] = _guess_owner_email(panel_owner, existing_email, website_url)
-        return result
-
-    # Source pipeline — stop as soon as we find a name
-    sources = [
-        ("Website",   lambda: _scrape_website_team(website_url, business_name)),
-        ("LinkedIn",  lambda: _search_linkedin(business_name, city)),
-        ("Facebook",  lambda: _search_facebook(business_name, city)),
-        ("Instagram", lambda: _search_instagram(business_name, city)),
-        ("BBB",       lambda: _search_bbb(business_name, city)),
-    ]
-
-    for source_name, search_fn in sources:
-        if _google_blocked and source_name != "Website":
-            continue  # skip Google-dependent sources if rate-limited
-        name = search_fn()
+    # --- Datacenter-safe sources (Tier 1 — always work) ---
+    # Website scraping returns (name, emails_found_list)
+    if website_url:
+        name, emails = _scrape_website_for_owner_and_email(website_url, business_name)
+        if emails:
+            result["found_email"] = emails[0]  # best email from website
         if name:
             result["owner"] = name
-            result["source"] = source_name
+            result["source"] = "Website"
             result["personal_email"] = _guess_owner_email(name, existing_email, website_url)
             return result
+
+    # YellowPages direct scrape
+    yp_result = _scrape_yellowpages_owner(business_name, city)
+    if yp_result.get("owner"):
+        result["owner"] = yp_result["owner"]
+        result["source"] = "YellowPages"
+        if yp_result.get("email"):
+            result["found_email"] = yp_result["email"]
+        if yp_result.get("website") and not website_url:
+            website_url = yp_result["website"]  # use for email guessing
+        result["personal_email"] = _guess_owner_email(
+            yp_result["owner"], existing_email, website_url
+        )
+        return result
+    elif yp_result.get("email") and not result["found_email"]:
+        result["found_email"] = yp_result["email"]
+    if yp_result.get("website") and not website_url:
+        website_url = yp_result["website"]
+
+    # Canada411 direct scrape
+    name_411 = _scrape_canada411_owner(business_name, city)
+    if name_411:
+        result["owner"] = name_411
+        result["source"] = "Canada411"
+        result["personal_email"] = _guess_owner_email(name_411, existing_email, website_url)
+        return result
+
+    # --- Google-dependent sources (Tier 2 — fallback, may be rate limited) ---
+    if _is_google_available():
+        for source_name, queries in [
+            ("LinkedIn", [
+                f'site:linkedin.com/in "{business_name}" "{city}" owner OR founder OR manager',
+                f'site:linkedin.com/in "{business_name}" "{city}"',
+            ]),
+            ("Facebook", [
+                f'site:facebook.com "{business_name}" "{city}" owner OR founder',
+                f'site:facebook.com "{business_name}" "{city}"',
+            ]),
+        ]:
+            if not _is_google_available():
+                print(f"     [{source_name}] Skipped — Google cooldown active")
+                break
+            name = _google_search_for_name(queries, source_name)
+            if name:
+                result["owner"] = name
+                result["source"] = source_name
+                result["personal_email"] = _guess_owner_email(name, existing_email, website_url)
+                return result
+    else:
+        print(f"     [Google] All Google sources skipped — cooldown active")
 
     return result
 
 
-# -- Source 1: Google Knowledge Panel + Reviews --------------------------------
+# -- Source 1: Google Panel (reviews + owner, fallback only) -------------------
 
 def _scrape_google_panel(business_name, city):
     """
-    Single Google search that extracts:
-    - Star rating + review count (for compliments)
-    - Owner/founder name from knowledge panel snippet
-    Returns (stars, count, owner_name_or_empty)
+    Google search for reviews + knowledge panel owner.
+    Returns (stars, count, owner_name_or_empty).
+    Gracefully fails — sets cooldown on 429 instead of killing everything.
     """
-    global _google_blocked
-    if _google_blocked:
-        return 0, 0, ""
     try:
         query = f"{business_name} {city}"
         url = f"https://www.google.com/search?q={quote_plus(query)}&gl=ca&hl=en"
         r = requests.get(url, headers=HEADERS, timeout=10)
 
         if r.status_code == 429:
-            print(f"     [Google] 429 rate limited -- disabling Google sources")
-            _google_blocked = True
+            _set_google_cooldown(300)
             return 0, 0, ""
         if r.status_code != 200:
+            print(f"     [Google] HTTP {r.status_code}")
             return 0, 0, ""
 
         text = r.text
-        soup = BeautifulSoup(text, "lxml")
+        soup = BeautifulSoup(r.text, "lxml")
 
-        # --- Extract reviews ---
+        # --- Reviews ---
         star_match = re.search(r'(\d+\.?\d*)\s*(?:stars?|/\s*5)', text, re.I)
         count_match = re.search(r'(\d[\d,]*)\s*(?:reviews?|ratings?|Google reviews?)', text, re.I)
         stars = float(star_match.group(1)) if star_match else 0
@@ -410,30 +464,30 @@ def _scrape_google_panel(business_name, city):
         if stars > 0:
             print(f"     [Reviews] {stars} stars, {count} reviews")
 
-        # --- Extract owner from knowledge panel ---
+        # --- Owner from panel ---
         owner = ""
-        # Pattern: "Owner: Name" or "Founder: Name" in knowledge panel
         for pattern in [
-            r'(?:Owner|Founder|Proprietor|President|CEO)\s*[:]\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
-            r'(?:Owned by|Founded by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+            rf'(?:{_TITLE_KEYWORDS})\s*[:]\s*({_FULL_NAME})',
+            rf'(?:Owned by|Founded by)\s+({_FULL_NAME})',
         ]:
-            match = re.search(pattern, text)
+            match = re.search(pattern, text, re.I)
             if match:
-                name = match.group(1).strip()
+                name = _normalize_name(match.group(1).strip())
                 if _is_valid_person_name(name):
                     owner = name
                     print(f"     [Google] Found in panel: {owner}")
                     break
 
-        # Also check structured data / knowledge panel divs
         if not owner:
             for el in soup.select("[data-attrid*='owner'], [data-attrid*='founder']"):
                 txt = el.get_text(strip=True)
-                name_match = re.search(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)', txt)
-                if name_match and _is_valid_person_name(name_match.group(1)):
-                    owner = name_match.group(1).strip()
-                    print(f"     [Google] Found in attrid: {owner}")
-                    break
+                name_match = re.search(rf'({_FULL_NAME})', txt)
+                if name_match:
+                    name = _normalize_name(name_match.group(1).strip())
+                    if _is_valid_person_name(name):
+                        owner = name
+                        print(f"     [Google] Found in attrid: {owner}")
+                        break
 
         time.sleep(random.uniform(1.5, 3))
         return stars, count, owner
@@ -443,30 +497,32 @@ def _scrape_google_panel(business_name, city):
         return 0, 0, ""
 
 
-# -- Source 2: Business Website About/Team Page --------------------------------
+# -- Source 2: Business Website (owner name + email scraping) ------------------
 
-def _scrape_website_team(website_url, business_name):
+def _scrape_website_for_owner_and_email(website_url, business_name):
     """
-    Hit the business website's About, Team, or Staff page.
-    Look for owner/founder names in headings, meta, and body text.
+    Hit the business website's About, Team, Contact pages.
+    Returns (owner_name, [list_of_emails_found]).
     """
     if not website_url:
-        return ""
+        return "", []
 
-    # Normalize URL
     base = website_url.rstrip("/")
     if not base.startswith("http"):
         base = "https://" + base
 
-    # Pages to check (most common locations for owner info)
     pages = [
         base + "/about",
         base + "/about-us",
         base + "/team",
         base + "/our-team",
-        base + "/staff",
-        base,  # homepage as fallback
+        base + "/contact",
+        base + "/contact-us",
+        base,  # homepage fallback
     ]
+
+    found_owner = ""
+    found_emails = []
 
     for page_url in pages:
         try:
@@ -477,101 +533,262 @@ def _scrape_website_team(website_url, business_name):
             soup = BeautifulSoup(r.text, "lxml")
             text = soup.get_text(" ", strip=True)
 
-            # Method 1: Look for "Owner: Name" patterns
-            for pattern in [
-                r'(?:Owner|Founder|Proprietor|President|CEO|Principal|Director)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
-                r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*[,\-]\s*(?:Owner|Founder|Proprietor|President|CEO|Principal|Director)',
-                r'(?:owned and operated by|founded by|run by|managed by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
-                r'(?:Meet|About)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*[,\-]\s*(?:the\s+)?(?:owner|founder)',
-            ]:
-                match = re.search(pattern, text)
-                if match:
-                    name = match.group(1).strip()
-                    if _is_valid_person_name(name):
-                        print(f"     [Website] Found on {page_url.split('/')[-1]}: {name}")
-                        return name
+            # --- Scrape emails from this page ---
+            for mailto in soup.select("a[href^='mailto:']"):
+                email = mailto.get("href", "").replace("mailto:", "").split("?")[0].strip().lower()
+                if email and "@" in email and email not in found_emails:
+                    found_emails.append(email)
 
-            # Method 2: JSON-LD structured data
-            for script in soup.select('script[type="application/ld+json"]'):
-                try:
-                    ld = json.loads(script.string or "")
-                    items = ld if isinstance(ld, list) else [ld]
-                    for item in items:
-                        for key in ("founder", "employee", "author", "member"):
-                            person = item.get(key)
-                            if isinstance(person, dict):
-                                name = person.get("name", "")
-                                if _is_valid_person_name(name):
-                                    print(f"     [Website] Found in JSON-LD: {name}")
-                                    return name
-                            elif isinstance(person, list):
-                                for p in person:
-                                    if isinstance(p, dict):
-                                        name = p.get("name", "")
+            # Regex email extraction from page text
+            for match in re.finditer(r'[\w.+-]+@[\w-]+\.[\w.-]+', text):
+                email = match.group(0).lower().rstrip(".")
+                if email not in found_emails and not email.endswith((".png", ".jpg", ".gif")):
+                    found_emails.append(email)
+
+            # --- Scrape owner name ---
+            if not found_owner:
+                for pattern in [
+                    rf'(?:{_TITLE_KEYWORDS})[:\s]+({_FULL_NAME})',
+                    rf'({_FULL_NAME})\s*[,\-]\s*(?:{_TITLE_KEYWORDS})',
+                    rf'(?:owned and operated by|founded by|run by|managed by)\s+({_FULL_NAME})',
+                    rf'(?:Meet|About)\s+({_FULL_NAME})\s*[,\-]\s*(?:the\s+)?(?:owner|founder)',
+                ]:
+                    match = re.search(pattern, text, re.I)
+                    if match:
+                        name = _normalize_name(match.group(1).strip())
+                        if _is_valid_person_name(name):
+                            found_owner = name
+                            print(f"     [Website] Found on /{page_url.split('/')[-1]}: {name}")
+                            break
+
+                # JSON-LD structured data
+                if not found_owner:
+                    for script in soup.select('script[type="application/ld+json"]'):
+                        try:
+                            ld = json.loads(script.string or "")
+                            items = ld if isinstance(ld, list) else [ld]
+                            for item in items:
+                                for key in ("founder", "employee", "author", "member"):
+                                    person = item.get(key)
+                                    if isinstance(person, dict):
+                                        name = person.get("name", "")
                                         if _is_valid_person_name(name):
-                                            print(f"     [Website] Found in JSON-LD: {name}")
-                                            return name
-                except (json.JSONDecodeError, TypeError):
-                    pass
+                                            found_owner = _normalize_name(name)
+                                            print(f"     [Website] JSON-LD: {found_owner}")
+                                    elif isinstance(person, list):
+                                        for p in person:
+                                            if isinstance(p, dict):
+                                                name = p.get("name", "")
+                                                if _is_valid_person_name(name):
+                                                    found_owner = _normalize_name(name)
+                                                    print(f"     [Website] JSON-LD: {found_owner}")
+                                                    break
+                                    if found_owner:
+                                        break
+                                if found_owner:
+                                    break
+                        except (json.JSONDecodeError, TypeError):
+                            pass
 
-            # Method 3: OG / meta author tags
-            for meta in soup.select('meta[name="author"], meta[property="article:author"]'):
-                name = (meta.get("content") or "").strip()
-                if _is_valid_person_name(name):
-                    print(f"     [Website] Found in meta: {name}")
-                    return name
+                # Meta author
+                if not found_owner:
+                    for meta in soup.select('meta[name="author"], meta[property="article:author"]'):
+                        name = (meta.get("content") or "").strip()
+                        if _is_valid_person_name(name):
+                            found_owner = _normalize_name(name)
+                            print(f"     [Website] Meta author: {found_owner}")
+                            break
 
-        except Exception:
+            # If we found both owner and emails, stop early
+            if found_owner and found_emails:
+                break
+
+        except Exception as e:
+            print(f"     [Website] Error on {page_url.split('/')[-1]}: {e}")
             continue
 
-        time.sleep(random.uniform(0.5, 1.5))
+        time.sleep(random.uniform(0.5, 1))
+
+    if found_emails:
+        print(f"     [Website] Emails found: {', '.join(found_emails[:3])}")
+
+    return found_owner, found_emails
+
+
+# -- Source 3: YellowPages.ca Direct Scrape ------------------------------------
+
+def _scrape_yellowpages_owner(business_name, city):
+    """
+    Search YellowPages.ca directly (no Google needed — proven on GitHub Actions).
+    Returns dict: {owner, email, website} or empty values.
+    """
+    result = {"owner": "", "email": "", "website": ""}
+    try:
+        location = f"{city}+ON".replace(" ", "+")
+        search_url = (
+            f"https://www.yellowpages.ca/search/si/1/"
+            f"{quote_plus(business_name)}/{location}"
+        )
+        r = requests.get(search_url, headers=HEADERS, timeout=12)
+        if r.status_code != 200:
+            print(f"     [YP] Search HTTP {r.status_code}")
+            return result
+
+        soup = BeautifulSoup(r.text, "lxml")
+
+        # Find the best matching listing
+        listings = soup.select("div.listing, div.listing__content, div[class*='listing']")
+        if not listings:
+            listings = soup.select("div.resultList div, div.result")
+
+        detail_url = ""
+        for listing in listings[:5]:
+            name_el = listing.select_one(
+                "a.listing__name--link, h3.listing__name, "
+                "a[class*='listing__name'], h2 a, h3 a"
+            )
+            if not name_el:
+                continue
+            listed_name = name_el.get_text(strip=True).lower()
+            # Check if this listing matches our business
+            if business_name.lower()[:10] in listed_name or listed_name in business_name.lower():
+                href = name_el.get("href", "")
+                if href and not href.startswith("http"):
+                    href = "https://www.yellowpages.ca" + href
+                detail_url = href
+
+                # Grab website from listing
+                web_el = listing.select_one("a[class*='website'], a[data-analytics='website']")
+                if web_el:
+                    result["website"] = web_el.get("href", "")
+
+                # Grab email from listing
+                email_el = listing.select_one("a[href^='mailto:']")
+                if email_el:
+                    result["email"] = email_el.get("href", "").replace("mailto:", "").strip()
+                break
+
+        if not detail_url:
+            print(f"     [YP] No matching listing found")
+            return result
+
+        # Visit detail page for owner name + more contact info
+        time.sleep(random.uniform(1, 2))
+        r2 = requests.get(detail_url, headers=HEADERS, timeout=12)
+        if r2.status_code == 200:
+            detail_soup = BeautifulSoup(r2.text, "lxml")
+            detail_text = detail_soup.get_text(" ", strip=True)
+
+            # Look for owner name in detail page
+            for pattern in [
+                rf'(?:{_TITLE_KEYWORDS})[:\s]+({_FULL_NAME})',
+                rf'({_FULL_NAME})\s*[,\-]\s*(?:{_TITLE_KEYWORDS})',
+                rf'(?:owned by|founded by|operated by|managed by)\s+({_FULL_NAME})',
+            ]:
+                match = re.search(pattern, detail_text, re.I)
+                if match:
+                    name = _normalize_name(match.group(1).strip())
+                    if _is_valid_person_name(name):
+                        result["owner"] = name
+                        print(f"     [YP] Found owner: {name}")
+                        break
+
+            # Grab email from detail page if not found yet
+            if not result["email"]:
+                for mailto in detail_soup.select("a[href^='mailto:']"):
+                    email = mailto.get("href", "").replace("mailto:", "").split("?")[0].strip()
+                    if email and "@" in email:
+                        result["email"] = email.lower()
+                        break
+                if not result["email"]:
+                    email_match = re.search(r'[\w.+-]+@[\w-]+\.[\w.-]+', detail_text)
+                    if email_match:
+                        result["email"] = email_match.group(0).lower().rstrip(".")
+
+            # Grab website if not found yet
+            if not result["website"]:
+                for a in detail_soup.select("a[href^='http']"):
+                    href = a.get("href", "")
+                    if "yellowpages.ca" not in href and "ypcdn" not in href:
+                        result["website"] = href
+                        break
+
+        if result["email"]:
+            print(f"     [YP] Email found: {result['email']}")
+        if result["website"]:
+            print(f"     [YP] Website found: {result['website']}")
+
+        time.sleep(random.uniform(1, 2))
+
+    except Exception as e:
+        print(f"     [YP] Error: {e}")
+
+    return result
+
+
+# -- Source 4: Canada411 Direct Scrape -----------------------------------------
+
+def _scrape_canada411_owner(business_name, city):
+    """
+    Search 411.ca directly (no Google needed — proven on GitHub Actions).
+    Returns owner name or "".
+    """
+    try:
+        url = (
+            f"https://411.ca/search/"
+            f"?q={quote_plus(business_name)}"
+            f"&l={quote_plus(city + ' ON')}"
+            f"&t=business"
+        )
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        if r.status_code != 200:
+            print(f"     [411] HTTP {r.status_code}")
+            return ""
+
+        soup = BeautifulSoup(r.text, "lxml")
+        listings = soup.select(
+            "div.listing, div.vcard, div.result-card, "
+            "div[class*='listing'], article"
+        )
+
+        for listing in listings[:5]:
+            name_el = listing.select_one("h2 a, h3 a, a.listing-name, span.fn")
+            if not name_el:
+                continue
+            listed_name = name_el.get_text(strip=True).lower()
+            if business_name.lower()[:10] not in listed_name:
+                continue
+
+            # Found matching listing — look for contact person
+            all_text = listing.get_text(" ", strip=True)
+            for pattern in [
+                rf'(?:{_TITLE_KEYWORDS})[:\s]+({_FULL_NAME})',
+                rf'({_FULL_NAME})\s*[,\-]\s*(?:{_TITLE_KEYWORDS})',
+                rf'(?:Contact|Representative)[:\s]+({_FULL_NAME})',
+            ]:
+                match = re.search(pattern, all_text, re.I)
+                if match:
+                    name = _normalize_name(match.group(1).strip())
+                    if _is_valid_person_name(name):
+                        print(f"     [411] Found: {name}")
+                        return name
+
+        time.sleep(random.uniform(1, 2))
+
+    except Exception as e:
+        print(f"     [411] Error: {e}")
 
     return ""
 
 
-# -- Source 3-6: Social / Directory Google Searches ----------------------------
-
-def _search_linkedin(business_name, city):
-    """Search Google for LinkedIn profiles linked to this business."""
-    queries = [
-        f'site:linkedin.com/in "{business_name}" "{city}" owner OR founder OR manager OR director',
-        f'site:linkedin.com/in "{business_name}" "{city}"',
-    ]
-    return _google_search_for_name(queries, "LinkedIn")
-
-
-def _search_facebook(business_name, city):
-    """Search Google for Facebook business pages to find owner names."""
-    queries = [
-        f'site:facebook.com "{business_name}" "{city}" owner OR founder OR manager',
-        f'site:facebook.com "{business_name}" "{city}"',
-    ]
-    return _google_search_for_name(queries, "Facebook")
-
-
-def _search_instagram(business_name, city):
-    """Search Google for Instagram profiles — many SMB owners use their real name."""
-    queries = [
-        f'site:instagram.com "{business_name}" "{city}"',
-    ]
-    return _google_search_for_name(queries, "Instagram")
-
-
-def _search_bbb(business_name, city):
-    """Search Google for BBB listings — often include business contact names."""
-    queries = [
-        f'site:bbb.org "{business_name}" "{city}"',
-    ]
-    return _google_search_for_name(queries, "BBB")
-
+# -- Source 5-6: Google-dependent (LinkedIn, Facebook) -------------------------
 
 def _google_search_for_name(queries, source_name):
     """
     Execute Google searches and extract person names from results.
-    Works for LinkedIn, Facebook, Instagram, BBB result patterns.
+    Uses cooldown instead of permanent block on 429.
     """
-    global _google_blocked
-    if _google_blocked:
+    if not _is_google_available():
         return ""
 
     for query in queries:
@@ -580,36 +797,30 @@ def _google_search_for_name(queries, source_name):
             r = requests.get(url, headers=HEADERS, timeout=10)
 
             if r.status_code == 429:
-                print(f"     [{source_name}] Google 429 -- disabling Google sources")
-                _google_blocked = True
+                _set_google_cooldown(300)
                 return ""
             if r.status_code != 200:
                 continue
 
             soup = BeautifulSoup(r.text, "lxml")
 
-            # Method 1: Parse search result titles
-            # LinkedIn: "FirstName LastName - Title - Company | LinkedIn"
-            # Facebook: "FirstName LastName - City | Facebook"
-            # Instagram: "FirstName LastName (@handle) | Instagram"
+            # Parse search result titles
             for div in soup.select("div.g, div[data-sokoban-container]"):
                 title_el = div.select_one("h3")
                 if not title_el:
                     continue
                 title = title_el.get_text(strip=True)
 
-                # Extract name from beginning of title
                 name_match = re.match(
-                    r'^([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*[-|~(]',
-                    title
+                    rf'^({_FULL_NAME})\s*[-|~(]', title
                 )
                 if name_match:
-                    name = name_match.group(1).strip()
+                    name = _normalize_name(name_match.group(1).strip())
                     if _is_valid_person_name(name):
                         print(f"     [{source_name}] Found in title: {name}")
                         return name
 
-            # Method 2: Parse snippets for title patterns
+            # Parse snippets
             for div in soup.select("div.g"):
                 snippet_el = div.select_one("div.VwiC3b, span.st")
                 if not snippet_el:
@@ -617,13 +828,13 @@ def _google_search_for_name(queries, source_name):
                 snippet = snippet_el.get_text(strip=True)
 
                 for pattern in [
-                    r'(?:Owner|Founder|Manager|Director|President|CEO|Proprietor|Principal)[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)',
-                    r'([A-Z][a-z]+\s+[A-Z][a-z]+)\s*[-,]\s*(?:Owner|Founder|Manager|Director|President|CEO|Proprietor|Principal)',
-                    r'(?:owned by|founded by|managed by|operated by|run by)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)',
+                    rf'(?:{_TITLE_KEYWORDS})[:\s]+({_FULL_NAME})',
+                    rf'({_FULL_NAME})\s*[-,]\s*(?:{_TITLE_KEYWORDS})',
+                    rf'(?:owned by|founded by|managed by|operated by|run by)\s+({_FULL_NAME})',
                 ]:
-                    match = re.search(pattern, snippet)
+                    match = re.search(pattern, snippet, re.I)
                     if match:
-                        name = match.group(1).strip()
+                        name = _normalize_name(match.group(1).strip())
                         if _is_valid_person_name(name):
                             print(f"     [{source_name}] Found in snippet: {name}")
                             return name
@@ -640,13 +851,9 @@ def _google_search_for_name(queries, source_name):
 
 def _guess_owner_email(owner_name, existing_email, website_url):
     """
-    Given an owner name and the business domain, generate likely personal
-    email addresses. Returns the best guess or "" if no domain available.
-
-    Common SMB patterns:
-      franco@domain.com, f.digiovanni@domain.com, franco.digiovanni@domain.com
+    Given an owner name and business domain, construct likely personal email.
+    Returns best guess or "" if no domain.
     """
-    # Extract domain from existing email or website
     domain = ""
     if existing_email and "@" in existing_email:
         domain = existing_email.split("@")[1].strip().lower()
@@ -661,57 +868,64 @@ def _guess_owner_email(owner_name, existing_email, website_url):
     if len(parts) < 2:
         return ""
 
-    first = parts[0]
-    last = parts[-1]
+    first = re.sub(r"[^a-z]", "", parts[0])
+    last = re.sub(r"[^a-z]", "", parts[-1])
+    if not first or not last:
+        return ""
 
-    # If existing email already looks personal (not generic), keep it
-    if existing_email:
-        email_local = existing_email.split("@")[0].lower()
-        generic_prefixes = {"info", "admin", "contact", "hello", "support",
-                            "sales", "office", "help", "mail", "enquiries",
-                            "inquiries", "noreply", "no-reply", "webmaster"}
-        if email_local not in generic_prefixes:
-            return ""  # they already have a personal-looking email
+    # If existing email already looks personal, don't replace it
+    if existing_email and "@" in existing_email:
+        local = existing_email.split("@")[0].lower()
+        generic = {"info", "admin", "contact", "hello", "support",
+                    "sales", "office", "help", "mail", "enquiries",
+                    "inquiries", "noreply", "no-reply", "webmaster"}
+        if local not in generic:
+            return ""  # already has a personal email
 
-    # Generate candidates — most common patterns for small businesses
-    candidates = [
-        f"{first}@{domain}",               # franco@joespizza.ca
-        f"{first}.{last}@{domain}",         # franco.digiovanni@joespizza.ca
-        f"{first[0]}{last}@{domain}",       # fdigiovanni@joespizza.ca
-        f"{first}{last[0]}@{domain}",       # francod@joespizza.ca
-        f"{first[0]}.{last}@{domain}",      # f.digiovanni@joespizza.ca
-    ]
-
-    # Return top candidate (firstname@domain is most common for SMBs)
-    best = candidates[0]
+    best = f"{first}@{domain}"
     print(f"     [Email] Guessed: {best}")
     return best
 
 
-# -- Name Validation -----------------------------------------------------------
+# -- Name Helpers --------------------------------------------------------------
+
+def _normalize_name(name):
+    """Normalize ALL-CAPS or weird casing to Title Case."""
+    if not name:
+        return name
+    if name.isupper() or name.islower():
+        # Handle hyphenated names: JEAN-PIERRE → Jean-Pierre
+        return "-".join(part.capitalize() for part in name.split("-"))  \
+            if "-" in name else name.title()
+    return name
+
 
 def _is_valid_person_name(name):
     """Validate that a string looks like a real person's name."""
     if not name or len(name) < 3 or len(name) > 40:
         return False
-    if any(c.isdigit() for c in name):
+    normalized = _normalize_name(name.strip())
+    if any(c.isdigit() for c in normalized):
         return False
-    if len(name.split()) < 2:
+    if len(normalized.split()) < 2:
         return False
-    # Filter out common false positives
-    false_positives = {
-        "About Us", "Contact Us", "Our Team", "Home Page",
-        "Read More", "Learn More", "Sign Up", "Log In",
-        "Privacy Policy", "Terms Service", "Google Maps",
-        "Google Reviews", "View More", "See More", "Show More",
-        "North York", "East York", "West Toronto", "South Etobicoke",
-        "Better Business", "Yellow Pages", "White Pages",
+    # False positives (case-insensitive check)
+    false_positives_lower = {
+        "about us", "contact us", "our team", "home page",
+        "read more", "learn more", "sign up", "log in",
+        "privacy policy", "terms service", "google maps",
+        "google reviews", "view more", "see more", "show more",
+        "north york", "east york", "west toronto", "south etobicoke",
+        "better business", "yellow pages", "white pages",
+        "all rights", "click here", "find out", "get started",
     }
-    if name in false_positives:
+    if normalized.lower() in false_positives_lower:
         return False
-    # Filter out names that are actually locations/businesses
-    if any(w in name.lower() for w in ["inc", "ltd", "llc", "corp", "restaurant",
-                                         "pizza", "salon", "dental", "auto", "clinic"]):
+    # Business words
+    biz_words = ["inc", "ltd", "llc", "corp", "restaurant", "pizza",
+                 "salon", "dental", "auto", "clinic", "services",
+                 "cleaning", "plumbing", "hvac", "roofing"]
+    if any(w in normalized.lower() for w in biz_words):
         return False
     return True
 
@@ -986,7 +1200,7 @@ def run_draft(max_drafts=20, dry_run=False):
     4. Save drafts to Franco's Gmail inbox
     """
     print("=" * 60)
-    print("  Unify Cold Email Agent v3.0 — DRAFT MODE")
+    print("  Unify Cold Email Agent v4.0 — DRAFT MODE")
     print("=" * 60)
     print(f"  Max drafts  : {max_drafts}")
     print(f"  Dry run     : {dry_run}")
@@ -1025,13 +1239,14 @@ def run_draft(max_drafts=20, dry_run=False):
         name = prospect.get("name", "Unknown")
         address = prospect.get("address", "")
         existing_email = prospect.get("email", "")
-        website = prospect.get("source", "")  # website URL if available from sourcer
+        website = prospect.get("website", "") or ""  # website URL from lead sourcer
 
-        # Extract website URL from notes if stored there
+        # Fallback: try to extract URL from notes field
         notes = prospect.get("notes", "") or ""
-        url_match = re.search(r'https?://[^\s]+', notes)
-        if url_match and not website:
-            website = url_match.group(0)
+        if not website:
+            url_match = re.search(r'https?://[^\s]+', notes)
+            if url_match:
+                website = url_match.group(0)
 
         # Extract city for search
         city = "Toronto"
@@ -1042,7 +1257,10 @@ def run_draft(max_drafts=20, dry_run=False):
             elif parts:
                 city = parts[0].strip()
 
-        print(f"\n  Enriching: {name} ({city})")
+        print(f"\n  [{needs_enrichment.index(prospect)+1}/{min(len(needs_enrichment), enrich_limit)}] "
+              f"Enriching: {name} ({city})")
+        print(f"    Website URL: {website or 'NONE'}")
+        print(f"    Existing email: {existing_email or 'NONE'}")
         enrichment = enrich_prospect(name, city, website_url=website, existing_email=existing_email)
 
         # Store review data regardless of owner name result
@@ -1065,19 +1283,37 @@ def run_draft(max_drafts=20, dry_run=False):
                 if enrichment["personal_email"]:
                     update_data["email"] = enrichment["personal_email"]
                     print(f"    Personal email: {enrichment['personal_email']}")
-                update_prospect_owner(pid, enrichment["owner"])
+                # If we found an email on the website but no personal email, still use it
+                elif enrichment.get("found_email") and not existing_email:
+                    update_data["email"] = enrichment["found_email"]
+                    print(f"    Website email: {enrichment['found_email']}")
                 patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
                 requests.patch(patch_url, headers=sb_headers(),
                     json=update_data, timeout=15)
         else:
-            print(f"    No owner found")
+            # Even without owner, store any email we found
+            if enrichment.get("found_email") and not existing_email and not dry_run:
+                patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
+                requests.patch(patch_url, headers=sb_headers(),
+                    json={"email": enrichment["found_email"]}, timeout=15)
+                print(f"    No owner, but found email: {enrichment['found_email']}")
+            else:
+                print(f"    No owner found")
 
         # Rate limit between searches
         time.sleep(random.uniform(2, 4))
 
     source_summary = ", ".join(f"{v} {k}" for k, v in sorted(source_counts.items(), key=lambda x: -x[1]))
-    print(f"\n  Enrichment complete: {enriched_count} names found")
-    print(f"    Sources: {source_summary or 'none'}")
+    attempted = min(len(needs_enrichment), enrich_limit)
+    print(f"\n  {'='*56}")
+    print(f"  ENRICHMENT SUMMARY")
+    print(f"  {'='*56}")
+    print(f"    Total needing enrichment : {len(needs_enrichment)}")
+    print(f"    Attempted this run       : {attempted}")
+    print(f"    Owner names found        : {enriched_count}")
+    print(f"    Success rate             : {enriched_count}/{attempted} ({(enriched_count*100//attempted) if attempted else 0}%)")
+    print(f"    Sources breakdown        : {source_summary or 'none'}")
+    print(f"    Google available         : {'Yes' if _is_google_available() else 'No (cooldown)'}")
 
     # =========================================================================
     # PHASE 2: Draft emails for prospects with owner names
@@ -1191,7 +1427,7 @@ def run_draft(max_drafts=20, dry_run=False):
 def run_send(dry_run=False):
     """Send approved emails from agent_queue via Resend API."""
     print("=" * 60)
-    print("  Unify Cold Email Agent v3.0 — SEND MODE")
+    print("  Unify Cold Email Agent v4.0 — SEND MODE")
     print("=" * 60)
     print(f"  Resend : {'Configured' if RESEND_API_KEY else 'No key'}")
     print(f"  Sender : {SENDER_EMAIL}")
@@ -1256,7 +1492,7 @@ def run_send(dry_run=False):
 # -- CLI ----------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Unify Cold Email Agent v3.0")
+    parser = argparse.ArgumentParser(description="Unify Cold Email Agent v4.0")
     parser.add_argument("--draft", action="store_true",
                         help="Enrich names + generate email drafts in Gmail")
     parser.add_argument("--send", action="store_true",

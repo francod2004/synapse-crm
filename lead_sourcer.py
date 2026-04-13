@@ -1074,6 +1074,7 @@ def build_prospect(raw, vertical, area):
         "address": raw.get("address", "")[:200] or area,
         "phone": raw.get("phone", ""),
         "email": raw.get("email", ""),
+        "website": raw.get("website", ""),
         "owner": raw.get("owner", ""),
         "opp": _ai_gap_for_vertical(vertical, area),
         "action": "Research & qualify",
