@@ -183,14 +183,16 @@ def get_prospects_needing_enrichment():
     return needs
 
 
-def get_prospects_to_email():
+def get_prospects_to_email(redraft=False):
     """
     Fetch prospects ready for email drafting.
     The ONLY hard filter is: must have an email address.
     Owner name is preferred but NOT required — use "Hi there" fallback.
+    If redraft=True, also includes prospects already in PHONE CALL READY stage.
     """
     all_prospects = get_all_prospects()
     ready = []
+    allowed_statuses = {"NOT CONTACTED", "PHONE CALL READY"} if redraft else {"NOT CONTACTED"}
     for p in all_prospects:
         email = (p.get("email") or "").strip().lower()
         status = (p.get("status") or "").strip().upper()
@@ -201,7 +203,7 @@ def get_prospects_to_email():
         # Skip dead-end addresses
         if any(email.startswith(d) for d in DEAD_END_EMAILS):
             continue
-        if status != "NOT CONTACTED":
+        if status not in allowed_statuses:
             continue
 
         ready.append(p)
@@ -1609,7 +1611,7 @@ def run_draft(max_drafts=20, dry_run=False, redraft=False):
     print("  Drafting cold emails (email = only hard filter)")
     print("-" * 60)
 
-    prospects = get_prospects_to_email()
+    prospects = get_prospects_to_email(redraft=redraft)
     if not redraft:
         existing_ids = get_existing_queue_ids()
         prospects = [p for p in prospects if p.get("id") not in existing_ids]
