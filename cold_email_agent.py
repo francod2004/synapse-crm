@@ -381,6 +381,200 @@ def _domain_has_mx(domain):
             return False
 
 
+def _get_mx_host(domain):
+    """Get primary MX host for a domain (lowest preference value)."""
+    try:
+        import dns.resolver
+        answers = dns.resolver.resolve(domain, 'MX')
+        mx_records = sorted([(r.preference, str(r.exchange).rstrip('.')) for r in answers])
+        return mx_records[0][1] if mx_records else ""
+    except Exception:
+        return ""
+
+
+def _verify_smtp_mailbox(email, timeout=8):
+    """
+    Verify a mailbox exists via SMTP RCPT TO (without sending any message).
+    Returns True if mailbox accepts. Returns False on block/reject/port-blocked.
+
+    NOTE: Many residential ISPs (Rogers, Bell, Comcast) block outbound port 25.
+    In that case this silently returns False and the caller should fall back
+    to _domain_has_mx() construction.
+    """
+    try:
+        import smtplib
+        if not email or "@" not in email:
+            return False
+        domain = email.split("@")[1].strip().lower()
+        mx_host = _get_mx_host(domain)
+        if not mx_host:
+            return False
+
+        with smtplib.SMTP(timeout=timeout) as server:
+            server.connect(mx_host, 25)
+            server.helo("unifyaipartners.ca")
+            server.mail("franco@unifyaipartners.ca")
+            code, _ = server.rcpt(email)
+        # 250/251/252 = accepted; 550/551/553 = rejected; 4xx = greylist (treat as unknown -> False)
+        return code in (250, 251, 252)
+    except Exception:
+        return False
+
+
+# Email patterns to try (ordered by likelihood of success)
+_EMAIL_PATTERNS = ["info", "contact", "hello", "office", "admin", "inquiries", "team"]
+
+
+def _find_verified_email(domain):
+    """
+    Try multiple common email patterns against a domain using SMTP RCPT TO.
+    Returns first verified pattern. Falls back to info@domain if MX exists but
+    no pattern verifies (port 25 blocked, catch-all server, etc.) — never returns
+    worse than existing info@ construction.
+    """
+    if not domain or not _domain_has_mx(domain):
+        return ""
+
+    for pattern in _EMAIL_PATTERNS:
+        candidate = f"{pattern}@{domain}"
+        if _verify_smtp_mailbox(candidate, timeout=8):
+            print(f"     [SMTP] Verified: {candidate}")
+            return candidate
+        time.sleep(0.3)  # be polite to mail servers
+
+    # Fallback: info@ with just MX validation (same as old behavior)
+    print(f"     [SMTP] No pattern verified -- falling back to info@{domain} (MX only)")
+    return f"info@{domain}"
+
+
+def _scrape_facebook_email(business_name, city):
+    """
+    Search for business's Facebook page (via mobile FB) and scrape email from
+    About/Contact section. Returns email or "".
+    Fails silently if FB blocks — no permanent state, no cooldown needed.
+    """
+    try:
+        query = f"{business_name} {city}"
+        search_url = f"https://m.facebook.com/public/{quote_plus(query)}"
+        r = requests.get(search_url, headers=HEADERS, timeout=10, allow_redirects=True)
+        if r.status_code != 200:
+            return ""
+
+        soup = BeautifulSoup(r.text, "lxml")
+
+        # Find first FB page link matching business
+        page_url = ""
+        biz_lower = business_name.lower()
+        biz_first = biz_lower.split()[0] if biz_lower.split() else ""
+        for a in soup.select("a[href]"):
+            href = a.get("href", "")
+            text = a.get_text(strip=True).lower()
+            # FB page links look like /pages/... or /BusinessName-123/
+            if not (href.startswith("/") or "facebook.com/" in href):
+                continue
+            # Skip search/login/help URLs
+            if any(x in href for x in ["/search", "/login", "/help", "/privacy", "/terms"]):
+                continue
+            if biz_first and biz_first in text and len(text) > 2:
+                page_url = href if href.startswith("http") else f"https://m.facebook.com{href}"
+                break
+
+        if not page_url:
+            return ""
+
+        # Fetch page (About section often on main URL in mobile FB)
+        time.sleep(random.uniform(2, 4))
+        base_url = page_url.split("?")[0].rstrip("/")
+        for suffix in ["/about", ""]:
+            try:
+                target = base_url + suffix
+                r2 = requests.get(target, headers=HEADERS, timeout=10)
+                if r2.status_code != 200:
+                    continue
+                # Extract first non-junk email
+                for match in re.finditer(r'[\w.+-]+@[\w-]+\.[\w.-]+', r2.text):
+                    email = match.group(0).lower().rstrip(".")
+                    if email.endswith((".png", ".jpg", ".gif", ".webp", ".svg")):
+                        continue
+                    if any(d in email for d in ["facebook.com", "fbcdn", "fb.com"]):
+                        continue
+                    if any(email.startswith(x) for x in DEAD_END_EMAILS):
+                        continue
+                    print(f"     [Facebook] Found email: {email}")
+                    return email
+            except Exception:
+                continue
+
+    except Exception as e:
+        print(f"     [Facebook] Error: {e}")
+
+    return ""
+
+
+def _google_search_email(business_name, city):
+    """
+    Absolute last-resort Google search for business email address.
+    STRICTLY respects Google cooldown and adds long random delay (15-30s)
+    to avoid triggering spam block. Uses longer cooldown (600s) on 429.
+    """
+    if not _is_google_available():
+        print(f"     [Google Email] Skipped -- cooldown active")
+        return ""
+
+    try:
+        # Long randomized delay to look human
+        delay = random.uniform(15, 30)
+        print(f"     [Google Email] Waiting {delay:.0f}s before search...")
+        time.sleep(delay)
+
+        query = f'"{business_name}" "{city}" email contact'
+        url = f"https://www.google.com/search?q={quote_plus(query)}&num=10&gl=ca&hl=en"
+        r = requests.get(url, headers=HEADERS, timeout=12)
+
+        if r.status_code == 429:
+            _set_google_cooldown(600)  # longer cooldown since this is last-resort
+            print(f"     [Google Email] 429 -- extended cooldown 600s")
+            return ""
+        if r.status_code != 200:
+            return ""
+
+        soup = BeautifulSoup(r.text, "lxml")
+        text = soup.get_text(" ", strip=True)
+
+        # Pull all emails, filter junk
+        emails = re.findall(r'[\w.+-]+@[\w-]+\.[\w.-]+', text)
+        biz_first = business_name.lower().split()[0] if business_name else ""
+
+        candidates = []
+        for email in emails:
+            email = email.lower().rstrip(".")
+            if email.endswith((".png", ".jpg", ".gif", ".webp", ".svg")):
+                continue
+            if any(d in email for d in ["google.com", "googlemail", "gstatic", "googleusercontent", "schema.org", "w3.org"]):
+                continue
+            if any(email.startswith(x) for x in DEAD_END_EMAILS):
+                continue
+            candidates.append(email)
+
+        # Prefer emails where domain or local-part matches business name
+        for email in candidates:
+            local = email.split("@")[0]
+            domain = email.split("@")[1] if "@" in email else ""
+            if biz_first and len(biz_first) > 3 and (biz_first in domain or biz_first in local):
+                print(f"     [Google Email] Found business match: {email}")
+                return email
+
+        # Otherwise first reasonable candidate
+        if candidates:
+            print(f"     [Google Email] Found: {candidates[0]}")
+            return candidates[0]
+
+    except Exception as e:
+        print(f"     [Google Email] Error: {e}")
+
+    return ""
+
+
 def _is_google_available():
     return time.time() >= _google_cooldown_until
 
@@ -393,13 +587,16 @@ def _set_google_cooldown(seconds=300):
 
 def enrich_prospect(business_name, city, website_url="", existing_email=""):
     """
-    Full enrichment pipeline — datacenter-safe sources FIRST:
+    Full enrichment pipeline — datacenter-safe sources FIRST, email boosters LAST:
       1. YellowPages.ca (always works from datacenter — finds website URL + owner)
       2. Business website About/Team/Contact pages (uses URL from YP or CRM)
       3. Google panel (fallback — reviews + owner, cooldown on 429)
-      4. LinkedIn via Google (fallback)
-      5. Facebook via Google (fallback)
-    Returns dict: {owner, source, stars, review_count, personal_email, found_email}
+      4. LinkedIn + Facebook via Google (owner name fallback)
+      5. SMTP multi-pattern email discovery (info/contact/hello/office/admin)
+      6. Facebook page email scraping (business FB page About section)
+      7. Google "{business} email" search (absolute last resort, respects cooldown)
+    Returns dict: {owner, source, stars, review_count, personal_email, found_email,
+                   years_in_business, specialization, website}
     """
     result = {
         "owner": "", "source": "", "stars": 0,
@@ -500,16 +697,38 @@ def enrich_prospect(business_name, city, website_url="", existing_email=""):
                 return result
 
     # =========================================================================
-    # STEP 5: Domain-based email construction (last resort)
-    # If we have a website domain but still no email, construct info@domain
+    # STEP 5: SMTP multi-pattern email discovery (when we have a domain)
+    # Tries info/contact/hello/office/admin/inquiries/team via SMTP RCPT TO.
+    # Falls back to info@domain if port 25 blocked or no pattern verifies —
+    # never worse than the old info@-only construction.
     # =========================================================================
     if not result["found_email"] and not existing_email and website_url:
         domain = _extract_domain(website_url)
-        if domain and _domain_has_mx(domain):
-            result["found_email"] = f"info@{domain}"
-            print(f"     [Construct] info@{domain} (MX verified)")
-        elif domain:
-            print(f"     [Construct] {domain} has no MX records -- skipped")
+        if domain:
+            verified = _find_verified_email(domain)
+            if verified:
+                result["found_email"] = verified
+            else:
+                print(f"     [SMTP] {domain} has no MX records -- skipped")
+
+    # =========================================================================
+    # STEP 6: Facebook page email scraping (last-resort before Google)
+    # =========================================================================
+    if not result["found_email"] and not existing_email:
+        print(f"     [Facebook] Searching for page...")
+        fb_email = _scrape_facebook_email(business_name, city)
+        if fb_email:
+            result["found_email"] = fb_email
+
+    # =========================================================================
+    # STEP 7: Google search "business email" (absolute last resort)
+    # Respects existing Google cooldown + adds 15-30s delay to avoid spam block.
+    # Extended cooldown (600s) on 429 since this is the last fallback.
+    # =========================================================================
+    if not result["found_email"] and not existing_email and _is_google_available():
+        g_email = _google_search_email(business_name, city)
+        if g_email:
+            result["found_email"] = g_email
 
     result["website"] = website_url
     return result
