@@ -1688,7 +1688,21 @@ def run_enrich(max_enrich=50, dry_run=False):
     no_email_flagged = 0
     source_counts = {}
 
+    # Wall-clock cut-off: stop processing new prospects at 35 min so SMS summary
+    # still fires before the 45-min GitHub Actions workflow timeout kills us.
+    # Anything already persisted (via per-prospect Supabase PATCHes above) is kept.
+    ENRICH_TIMEOUT_SECONDS = 35 * 60
+    start_time = time.time()
+    timed_out = False
+
     for i, prospect in enumerate(needs_enrichment[:max_enrich]):
+        elapsed = time.time() - start_time
+        if elapsed > ENRICH_TIMEOUT_SECONDS:
+            print(f"\n  [TIMEOUT] Wall-clock cut-off hit at {elapsed/60:.1f} min. "
+                  f"Stopping after {i} prospects; proceeding to SMS summary.")
+            timed_out = True
+            break
+
         pid = prospect.get("id", "unknown")
         name = prospect.get("name", "Unknown")
         address = prospect.get("address", "")
@@ -1791,12 +1805,21 @@ def run_enrich(max_enrich=50, dry_run=False):
         time.sleep(random.uniform(2, 4))
 
     source_summary = ", ".join(f"{v} {k}" for k, v in sorted(source_counts.items(), key=lambda x: -x[1]))
-    attempted = min(len(needs_enrichment), max_enrich)
+    # `i` is the last prospect index we touched (0-based). If we broke on timeout,
+    # we processed `i` prospects (0..i-1). If the loop ran to completion, we
+    # processed i+1 prospects (0..i inclusive).
+    if timed_out:
+        attempted = i
+    else:
+        attempted = min(len(needs_enrichment), max_enrich)
+    elapsed_min = (time.time() - start_time) / 60
     print(f"\n  {'='*56}")
     print(f"  ENRICHMENT SUMMARY")
     print(f"  {'='*56}")
     print(f"    Total needing enrichment : {len(needs_enrichment)}")
     print(f"    Attempted this run       : {attempted}")
+    print(f"    Elapsed                  : {elapsed_min:.1f} min")
+    print(f"    Timed out                : {timed_out}")
     print(f"    Owner names found        : {enriched_count}")
     print(f"    Emails found/constructed : {emails_found}")
     print(f"    Websites discovered      : {websites_found}")
@@ -1805,8 +1828,9 @@ def run_enrich(max_enrich=50, dry_run=False):
     print(f"    Sources breakdown        : {source_summary or 'none'}")
     print(f"    Google available         : {'Yes' if _is_google_available() else 'No (cooldown)'}")
 
+    prefix = "Unify Enrichment (PARTIAL - 35m cutoff)" if timed_out else "Unify Enrichment"
     msg = (
-        f"Unify Enrichment: {attempted} prospects processed. "
+        f"{prefix}: {attempted} prospects processed in {elapsed_min:.0f}m. "
         f"{enriched_count} owners, {emails_found} emails found, "
         f"{websites_found} websites discovered. "
         f"{no_website_flagged} flagged no website, {no_email_flagged} flagged no email."
