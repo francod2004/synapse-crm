@@ -186,6 +186,7 @@ CHAIN_KEYWORDS = {
     "mcdonald", "burger king", "wendy", "subway", "tim horton", "tims",
     "starbucks", "dunkin", "popeyes", "chick-fil-a", "kfc", "taco bell",
     "pizza hut", "domino", "little caesars", "papa john", "five guys",
+    "pizza nova", "mamma's pizza", "mammas pizza", "cinnabon",
     "chipotle", "panera", "panda express", "arby", "sonic drive",
     "dairy queen", "baskin robbins", "cold stone", "auntie anne",
     "harvey", "mary brown", "swiss chalet", "st-hubert",
@@ -196,7 +197,8 @@ CHAIN_KEYWORDS = {
     "joey restaurant", "red lobster", "olive garden", "applebee",
     "denny", "ihop", "waffle house", "cheesecake factory",
     "the works", "wild wing", "buffalo wild wings", "wingstop",
-    "freshii", "qdoba", "nando",
+    "freshii", "qdoba", "nando", "sunset grill", "outback steakhouse",
+    "symposium cafe",
     # Coffee chains
     "second cup", "timothy", "balzac", "mccafe",
     # Grocery / retail chains
@@ -210,12 +212,15 @@ CHAIN_KEYWORDS = {
     "petsmart", "pet valu", "petcetera",
     "indigo", "chapters",
     "lcbo", "beer store",
+    "reitmans", "addition elle", "northern reflections",
+    "leon's furniture", "leons furniture", "bowring",
+    "adonis market", "adonis grocery",
     # Trade chains / big contractors
     "mr. rooter", "mr rooter", "roto-rooter", "roto rooter",
     "mr. electric", "mr electric", "molly maid", "merry maids",
     "servpro", "servicemaster", "home instead",
     # Dental / medical chains
-    "dentalcorp", "123 dentist", "appletree medical",
+    "dentalcorp", "123 dentist", "appletree medical", "lifemark",
     # Salon / spa chains
     "great clips", "supercuts", "first choice haircutters",
     "sport clips", "fantastic sams", "mastercuts",
