@@ -1,8 +1,10 @@
-name: Unify Cold Email Drafts
+name: Unify Cold Email Drafts (v6)
 
 on:
   schedule:
-    - cron: '53 14,17,20,23 * * *'  # 10:53 AM, 1:53 PM, 4:53 PM, 7:53 PM EDT (off-peak; 30 min after enrich @:23)
+    # Daily at 2:00 PM EDT (18:00 UTC). Also triggers the Day 4/11/14
+    # follow-up sweep as a second step in the same run.
+    - cron: '0 18 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -13,6 +15,8 @@ on:
         options:
           - draft
           - redraft
+          - follow-ups
+          - loom-recorded
           - send
       max:
         description: 'Max prospects to process'
@@ -30,9 +34,19 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 lxml dnspython google-auth google-auth-oauthlib google-api-python-client
+        run: pip install -r requirements.txt google-auth google-auth-oauthlib google-api-python-client
 
-      - name: Run Cold Email Agent
+      - name: Determine mode flag
+        id: mode
+        run: |
+          mode="${{ github.event.inputs.mode || 'draft' }}"
+          case "$mode" in
+            follow-ups)     echo "flag=--follow-ups"    >> "$GITHUB_OUTPUT" ;;
+            loom-recorded)  echo "flag=--loom-recorded" >> "$GITHUB_OUTPUT" ;;
+            *)              echo "flag=--$mode"         >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Run Cold Email Agent (primary mode)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -43,4 +57,33 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
-        run: python cold_email_agent.py --${{ github.event.inputs.mode || 'draft' }} --max ${{ github.event.inputs.max || '50' }}
+        run: python cold_email_agent.py ${{ steps.mode.outputs.flag }} --max ${{ github.event.inputs.max || '50' }}
+
+      # When running on the cron schedule (mode defaults to 'draft'), sweep
+      # follow-ups and any loom_recorded entries right after the Day-0 drafts.
+      # Manual dispatch runs don't trigger these extras -- only the selected mode.
+      - name: Follow-ups sweep (scheduled runs only)
+        if: github.event_name == 'schedule'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          FRANCO_PHONE: ${{ secrets.FRANCO_PHONE }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
+        run: python cold_email_agent.py --follow-ups --max 20
+
+      - name: Loom-recorded follow-up sweep (scheduled runs only)
+        if: github.event_name == 'schedule'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          FRANCO_PHONE: ${{ secrets.FRANCO_PHONE }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
+        run: python cold_email_agent.py --loom-recorded

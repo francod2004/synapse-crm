@@ -1,31 +1,40 @@
 #!/usr/bin/env python3
 """
-Unify Cold Email Agent v5.2
-=============================
-Reads enriched prospects from Supabase and drafts personalized cold emails
-using the 3-tier hook system and 9 vertical-specific templates. Enrichment
-has been extracted into enrichment_agent.py; this agent no longer fetches
-websites or scrapes directories.
+Unify Cold Email Agent v6 (Loom Pivot)
+=======================================
+Four-sentence cold emails that promise a 3-minute Loom. Reads enriched
+prospects from Supabase and drafts personalized touches routed through
+the agent_queue for Franco's approval.
+
+Key v6 changes vs v5.2:
+  - Email body collapsed to 4 sentences: greeting / hook / observation / Loom offer
+  - Vertical body templates removed -- entire "sell the consultation" section cut
+  - Subject kept: "Quick question about {business_name}"
+  - Hooks read rating / review_count / years_in_business directly from Supabase
+    columns (closes v6 wiring gap -- v5.2 parsed them out of the free-text notes)
+  - Priority-ordered processing: high drafts first, medium second, low skipped
+  - manual_work_signal drives sentence 3 (fallback per vertical if missing)
+  - agent_queue status enum extended with loom_requested + loom_recorded
+  - New follow-up sequence: Day 0 / Day 4 / Day 11 / Day 14 -- all via approval
+  - Seven paused verticals raise PausedVerticalError if ever queried (sourcer
+    filters to dental + trades, so reaching a paused vertical is a real bug)
+  - pending -> sent transition is handled by a DB trigger that bumps
+    prospects.touch_count + stamps last_touch_at atomically (see migrations)
 
 Modes:
-  --draft    : Create Gmail drafts from enriched data
-  --redraft  : Clear old queue entries and regenerate all drafts
-  --send     : Send approved emails via Resend (manual trigger)
+  --draft        : Draft Day-0 cold emails, priority-ordered
+  --follow-ups   : Draft Day 4 / Day 11 / Day 14 touches for sent prospects
+  --loom-script  : Poll loom_requested entries, draft 3-bullet Loom scripts
+  --loom-recorded: Draft follow-up emails with Loom link for loom_recorded entries
+  --send         : Send approved emails via Resend (unchanged from v5.2)
+  --mark-sent    : Flip a queue entry to 'sent' manually (triggers touch update)
+  --redraft      : Clear cold_email queue + reset PHONE CALL READY -> NOT CONTACTED
 
 RULE: Never send an email without Franco's explicit approval.
-Drafts go to Gmail for Franco to review, personalize, and send manually.
-
-Usage:
-    python cold_email_agent.py --draft              # Draft to Gmail
-    python cold_email_agent.py --send               # Send approved queue items
-    python cold_email_agent.py --draft --max 20     # Limit drafts per run
-    python cold_email_agent.py --dry-run --draft    # Preview without writing
-
-Requires env vars or .env file + gmail_token.json
 """
 
 import os, sys, re, json, time, argparse, base64
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -53,8 +62,8 @@ TWILIO_FROM    = os.getenv("TWILIO_FROM", "")
 FRANCO_PHONE   = os.getenv("FRANCO_PHONE", "")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 SENDER_EMAIL   = os.getenv("SENDER_EMAIL", "franco@unifyaipartners.ca")
+CRM_URL        = os.getenv("CRM_URL", "https://unify-crm-coral.vercel.app")
 
-# Gmail token can be env var (JSON string) or file
 GMAIL_TOKEN_JSON = os.getenv("GMAIL_TOKEN_JSON", "")
 GMAIL_TOKEN_FILE = os.getenv("GMAIL_TOKEN_FILE", "gmail_token.json")
 
@@ -67,19 +76,11 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-GENERIC_EMAILS = {
-    "info@", "admin@", "noreply@", "no-reply@", "contact@",
-    "hello@", "support@", "sales@", "office@", "help@",
-    "webmaster@", "mail@", "enquiries@", "inquiries@",
-}
-
 # Dead-end email prefixes -- never worth emailing
 DEAD_END_EMAILS = {"noreply@", "no-reply@", "donotreply@", "do-not-reply@"}
 
 # Aggregator / directory / social domains -- emails on these aren't real
-# business inboxes. They're scraped artifacts (e.g. info@canpages.ca is
-# the directory itself, not the business), or social platforms that don't
-# accept external email.
+# business inboxes (scraped artifacts pointing to the directory itself).
 DEAD_END_DOMAINS = {
     "canpages.ca",
     "foodpages.ca",
@@ -114,6 +115,77 @@ def _is_dead_end_email(email: str) -> bool:
     return False
 
 
+# -- v6 Hook Dict (27 hooks, 9 verticals x 3 tiers) ---------------------------
+#
+# Tier 1: reviews (rating >= 4.0 AND review_count >= 10)
+# Tier 2: years_in_business (>= 10)
+# Tier 3: research framing fallback
+#
+# Only Dental & Medical + Trades are filled. The other seven are sentinels --
+# the sourcer filters to dental + trades so a paused vertical should never
+# reach this agent. If it does, raise loudly rather than papering over with
+# placeholder copy.
+
+_PAUSED_VERTICAL = object()  # sentinel
+
+
+class PausedVerticalError(ValueError):
+    """Raised when a hook lookup hits a paused vertical -- indicates the
+    sourcer let through a prospect that shouldn't have reached the email
+    agent. Re-enable the vertical's hooks before running again."""
+
+
+_VERTICAL_HOOKS = {
+    "Dental & Medical": {
+        "tier1": "Saw the {rating} stars and {reviews}+ reviews on {business_name} -- the patient experience is clearly dialed in.",
+        "tier2": "{years}+ years serving the community is rare in independent dental -- {business_name} has clearly built something patients stick with.",
+        "tier3": "Been looking at independent dental practices across the GTA and {business_name} stood out as owner-operated rather than part of a corporate group.",
+    },
+    "Trades": {
+        "tier1": "The {rating} stars and {reviews}+ reviews on {business_name} tell me the actual work is dialed -- most trades I look at don't come close to that.",
+        "tier2": "{years}+ years in the trade is the kind of track record that usually means the work speaks for itself and referrals carry the business.",
+        "tier3": "Been looking at owner-operated trades across the GTA and {business_name} came up as independent rather than a franchise -- that's specifically who I wanted to reach.",
+    },
+    # Seven paused verticals -- hooks to be written together when sourcer
+    # re-expands beyond dental + trades (targeted v6.1, ~60 days out).
+    "Restaurants":           _PAUSED_VERTICAL,
+    "Retail":                _PAUSED_VERTICAL,
+    "Salons & Spas":         _PAUSED_VERTICAL,
+    "Professional Services": _PAUSED_VERTICAL,
+    "Fitness & Wellness":    _PAUSED_VERTICAL,
+    "Auto Services":         _PAUSED_VERTICAL,
+    "Cleaning & Property":   _PAUSED_VERTICAL,
+}
+
+
+# Fallback observation (sentence 3) when manual_work_signal is missing.
+# Only dental + trades are active; the paused verticals raise before we get
+# here, but the dict is keyed defensively.
+_OBSERVATION_FALLBACK = {
+    "Dental & Medical": "your current intake flow",
+    "Trades":           "your current quote process",
+}
+
+
+def _get_vertical_hook_set(vertical: str):
+    """Resolve a vertical name to its hook dict. Raises PausedVerticalError
+    if the vertical is paused. Raises KeyError for unknown verticals."""
+    if vertical not in _VERTICAL_HOOKS:
+        raise KeyError(
+            f"Unknown vertical '{vertical}' -- not in _VERTICAL_HOOKS. "
+            f"Active verticals: Dental & Medical, Trades."
+        )
+    hooks = _VERTICAL_HOOKS[vertical]
+    if hooks is _PAUSED_VERTICAL:
+        raise PausedVerticalError(
+            f"Hook for {vertical} is paused -- re-enable in v6.1 when sourcer "
+            f"expands beyond dental/trades. A prospect in this vertical reached "
+            f"the email agent, which means the sourcer's filter is broken or "
+            f"legacy data is leaking through."
+        )
+    return hooks
+
+
 # -- Gmail Setup --------------------------------------------------------------
 
 def get_gmail_service():
@@ -123,11 +195,8 @@ def get_gmail_service():
         from googleapiclient.discovery import build
 
         token_data = None
-
-        # Try env var first (for GitHub Actions)
         if GMAIL_TOKEN_JSON:
             token_data = json.loads(GMAIL_TOKEN_JSON)
-        # Fall back to file (for local runs)
         elif os.path.exists(GMAIL_TOKEN_FILE):
             with open(GMAIL_TOKEN_FILE) as f:
                 token_data = json.load(f)
@@ -143,9 +212,7 @@ def get_gmail_service():
             client_id=token_data.get("client_id"),
             client_secret=token_data.get("client_secret"),
         )
-
         return build("gmail", "v1", credentials=creds)
-
     except Exception as e:
         print(f"  Warning: Gmail setup failed: {e}")
         return None
@@ -155,30 +222,22 @@ def create_gmail_draft(service, to_email, to_name, subject, body_html, body_text
     """Create a draft email in Franco's Gmail inbox."""
     if not service:
         return False
-
     try:
         msg = MIMEMultipart("alternative")
-        msg["to"] = f"{to_name} <{to_email}>"
+        msg["to"] = f"{to_name} <{to_email}>" if to_name else to_email
         msg["from"] = f"Franco Di Giovanni <{SENDER_EMAIL}>"
         msg["subject"] = subject
 
-        # Plain text version
-        part1 = MIMEText(body_text, "plain")
-        # HTML version
-        part2 = MIMEText(body_html, "html")
-
-        msg.attach(part1)
-        msg.attach(part2)
+        msg.attach(MIMEText(body_text, "plain"))
+        msg.attach(MIMEText(body_html, "html"))
 
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         draft = service.users().drafts().create(
             userId="me",
             body={"message": {"raw": raw}}
         ).execute()
-
         print(f"    Gmail draft created: {draft['id']}")
         return True
-
     except Exception as e:
         print(f"    Gmail draft failed: {e}")
         return False
@@ -186,67 +245,83 @@ def create_gmail_draft(service, to_email, to_name, subject, body_html, body_text
 
 # -- Supabase Helpers ---------------------------------------------------------
 
-def sb_headers():
+def sb_headers(return_representation=False):
     return {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=minimal",
+        "Prefer": "return=representation" if return_representation else "return=minimal",
     }
 
 
-def get_all_prospects():
-    """Fetch ALL prospects from CRM."""
-    url = f"{SUPABASE_URL}/rest/v1/prospects?select=*"
+def _fetch_prospects(params: str):
+    """Generic prospect fetcher. `params` is a raw PostgREST query string
+    (without leading '?')."""
+    url = f"{SUPABASE_URL}/rest/v1/prospects?{params}"
     r = requests.get(url, headers=sb_headers(), timeout=15)
     if r.status_code == 200:
         return r.json()
-    print(f"  Warning: Could not fetch prospects: {r.status_code}")
+    print(f"  Warning: prospect fetch failed ({r.status_code}): {r.text[:200]}")
     return []
 
 
-def get_prospects_to_email(redraft=False):
+def get_prospects_by_priority(priority: str, redraft: bool = False):
+    """Fetch NOT CONTACTED prospects with email, filtered by priority.
+    priority: 'high' | 'medium' | 'low'
     """
-    Fetch prospects ready for email drafting.
-    The ONLY hard filter is: must have an email address.
-    Owner name is preferred but NOT required — use "Hi there" fallback.
-    If redraft=True, also includes prospects already in PHONE CALL READY stage.
-    """
-    all_prospects = get_all_prospects()
-    print(f"  [DEBUG] Total prospects fetched: {len(all_prospects)}")
-    ready = []
-    allowed_statuses = {"NOT CONTACTED", "PHONE CALL READY"} if redraft else {"NOT CONTACTED"}
-    no_email = 0
-    wrong_status = 0
-    dead_end = 0
-    for p in all_prospects:
-        email = (p.get("email") or "").strip().lower()
-        status = (p.get("status") or "").strip().upper()
-
-        # Email is the ONLY hard filter
-        if not email or "@" not in email:
-            no_email += 1
-            continue
-        # Skip dead-end addresses (noreply prefixes + aggregator domains)
-        if _is_dead_end_email(email):
-            dead_end += 1
-            continue
-        if status not in allowed_statuses:
-            wrong_status += 1
-            continue
-
-        ready.append(p)
-    print(f"  [DEBUG] Skipped: {no_email} no email, {dead_end} dead-end, {wrong_status} wrong status")
-    print(f"  [DEBUG] Ready for drafting: {len(ready)}")
-    return ready
+    statuses = "(NOT%20CONTACTED,PHONE%20CALL%20READY)" if redraft else "(NOT%20CONTACTED)"
+    params = (
+        f"select=*"
+        f"&status=in.{statuses}"
+        f"&email=not.is.null"
+        f"&priority=eq.{priority}"
+    )
+    rows = _fetch_prospects(params)
+    # Apply dead-end filter client-side (domain matching is easier than encoding in URL)
+    return [p for p in rows if not _is_dead_end_email(p.get("email") or "")]
 
 
-def get_existing_queue_ids():
-    """Fetch prospect IDs that already have a cold_email in agent_queue."""
+def get_prospects_for_loom_recorded():
+    """Fetch prospects whose most recent agent_queue entry is loom_recorded
+    AND whose loom_link is set (Franco has pasted it)."""
+    url = (
+        f"{SUPABASE_URL}/rest/v1/agent_queue"
+        f"?select=*,prospects(*)"
+        f"&action_type=eq.cold_email"
+        f"&status=eq.loom_recorded"
+    )
+    r = requests.get(url, headers=sb_headers(), timeout=15)
+    if r.status_code != 200:
+        print(f"  Warning: loom_recorded fetch failed ({r.status_code})")
+        return []
+    rows = r.json()
+    return [row for row in rows if (row.get("prospects") or {}).get("loom_link")]
+
+
+def get_loom_requested_entries():
+    """Fetch agent_queue entries with status=loom_requested that don't yet
+    have a loom_script in their payload."""
+    url = (
+        f"{SUPABASE_URL}/rest/v1/agent_queue"
+        f"?select=*,prospects(*)"
+        f"&action_type=eq.cold_email"
+        f"&status=eq.loom_requested"
+    )
+    r = requests.get(url, headers=sb_headers(), timeout=15)
+    if r.status_code != 200:
+        print(f"  Warning: loom_requested fetch failed ({r.status_code})")
+        return []
+    rows = r.json()
+    return [row for row in rows if not (row.get("payload") or {}).get("loom_script")]
+
+
+def get_existing_queue_ids(action_types=("cold_email",)):
+    """Fetch prospect IDs that already have an entry in agent_queue."""
+    types_filter = ",".join(action_types)
     url = (
         f"{SUPABASE_URL}/rest/v1/agent_queue"
         f"?select=prospect_id"
-        f"&action_type=eq.cold_email"
+        f"&action_type=in.({types_filter})"
     )
     r = requests.get(url, headers=sb_headers(), timeout=15)
     if r.status_code == 200:
@@ -254,25 +329,85 @@ def get_existing_queue_ids():
     return set()
 
 
-def insert_draft_to_queue(prospect_id, payload):
-    """Insert a draft email into agent_queue for tracking."""
+def get_sent_prospects_awaiting_followup():
+    """Fetch prospects where the last cold_email entry is 'sent' and touch_count
+    in (1, 2, 3) -- these need Day 4 / Day 11 / Day 14 follow-up evaluation."""
+    url = (
+        f"{SUPABASE_URL}/rest/v1/prospects"
+        f"?select=*"
+        f"&status=eq.PHONE%20CALL%20READY"
+        f"&touch_count=gte.1"
+        f"&touch_count=lte.3"
+        f"&last_touch_at=not.is.null"
+    )
+    r = requests.get(url, headers=sb_headers(), timeout=15)
+    if r.status_code != 200:
+        print(f"  Warning: follow-up fetch failed ({r.status_code})")
+        return []
+    return r.json()
+
+
+def insert_draft_to_queue(prospect_id, payload, action_type="cold_email"):
+    """Insert a draft (email or loom script or follow-up) into agent_queue."""
     url = f"{SUPABASE_URL}/rest/v1/agent_queue"
     row = {
         "prospect_id": prospect_id,
-        "action_type": "cold_email",
+        "action_type": action_type,
         "payload": payload,
         "status": "pending",
     }
-    headers = sb_headers()
-    headers["Prefer"] = "return=representation"
-    r = requests.post(url, headers=headers, json=[row], timeout=15)
-    return r.status_code in (200, 201)
+    r = requests.post(url, headers=sb_headers(return_representation=True),
+                      json=[row], timeout=15)
+    if r.status_code in (200, 201):
+        result = r.json()
+        return result[0]["id"] if result else True
+    print(f"    Queue insert failed ({r.status_code}): {r.text[:200]}")
+    return False
+
+
+def update_queue_payload(queue_id, payload):
+    """Merge new payload data into an existing agent_queue entry."""
+    url = f"{SUPABASE_URL}/rest/v1/agent_queue?id=eq.{queue_id}"
+    r = requests.patch(url, headers=sb_headers(),
+                       json={"payload": payload}, timeout=15)
+    return r.status_code in (200, 204)
 
 
 def update_queue_status(queue_id, status):
     url = f"{SUPABASE_URL}/rest/v1/agent_queue?id=eq.{queue_id}"
-    r = requests.patch(url, headers=sb_headers(), json={"status": status}, timeout=15)
+    r = requests.patch(url, headers=sb_headers(),
+                       json={"status": status}, timeout=15)
     return r.status_code in (200, 204)
+
+
+def mark_sent(queue_id, prospect_id=None):
+    """Flip agent_queue.status to 'sent'. A DB trigger on agent_queue
+    (bump_touch_on_send) updates prospects.last_touch_at and increments
+    touch_count in the same transaction. If the trigger isn't installed yet,
+    fall back to a two-step update (with explicit warning)."""
+    ok = update_queue_status(queue_id, "sent")
+    if not ok:
+        return False
+    # Best-effort verification that the trigger fired. If the trigger isn't
+    # installed, emit a warning and do the fallback write.
+    if prospect_id:
+        # Read the prospect back to see if last_touch_at is recent
+        url = (f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{prospect_id}"
+               f"&select=last_touch_at,touch_count")
+        r = requests.get(url, headers=sb_headers(), timeout=15)
+        if r.status_code == 200 and r.json():
+            row = r.json()[0]
+            last = row.get("last_touch_at")
+            if not last:
+                # Trigger didn't fire -- do the writes manually
+                print(f"    Warning: trigger not installed? Doing manual touch update.")
+                patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{prospect_id}"
+                new_count = (row.get("touch_count") or 0) + 1
+                requests.patch(patch_url, headers=sb_headers(), json={
+                    "last_touch_at": datetime.now(timezone.utc).isoformat(),
+                    "touch_count": new_count,
+                }, timeout=15)
+    return True
 
 
 def get_approved_emails():
@@ -283,20 +418,7 @@ def get_approved_emails():
         f"&status=eq.approved"
     )
     r = requests.get(url, headers=sb_headers(), timeout=15)
-    if r.status_code == 200:
-        return r.json()
-    return []
-
-
-def update_prospect_after_send(prospect_id):
-    today = datetime.now().strftime("%Y-%m-%d")
-    url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{prospect_id}"
-    r = requests.patch(
-        url, headers=sb_headers(),
-        json={"last_contact": today, "action": "Follow up in 5 days"},
-        timeout=15,
-    )
-    return r.status_code in (200, 204)
+    return r.json() if r.status_code == 200 else []
 
 
 # -- Twilio SMS ---------------------------------------------------------------
@@ -320,7 +442,7 @@ def send_sms(body):
     return False
 
 
-# -- Resend Email Sending (for --send mode) -----------------------------------
+# -- Resend (for --send mode) -------------------------------------------------
 
 def send_email_via_resend(to_email, to_name, subject, body_html, body_text):
     if not RESEND_API_KEY:
@@ -328,10 +450,8 @@ def send_email_via_resend(to_email, to_name, subject, body_html, body_text):
         return False
     r = requests.post(
         "https://api.resend.com/emails",
-        headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                 "Content-Type": "application/json"},
         json={
             "from": f"Franco Di Giovanni <{SENDER_EMAIL}>",
             "to": [to_email],
@@ -348,175 +468,682 @@ def send_email_via_resend(to_email, to_name, subject, body_html, body_text):
     return False
 
 
-def _clear_cold_email_queue():
-    """Delete all cold_email entries from agent_queue so drafts can be regenerated."""
-    url = (
-        f"{SUPABASE_URL}/rest/v1/agent_queue"
-        f"?action_type=eq.cold_email"
+# =============================================================================
+# v6 Email Generation
+# =============================================================================
+
+def _clean_business_name(name: str) -> str:
+    """Strip trailing period on 'Inc.' / 'Ltd.' so template sentences don't
+    produce double periods."""
+    return (name or "").rstrip().rstrip(".")
+
+
+def _extract_first_name(owner: str) -> str:
+    """Return first token of owner name, stripping titles like 'Dr.' etc."""
+    if not owner:
+        return ""
+    parts = owner.strip().split()
+    # Drop titles
+    while parts and parts[0].rstrip(".").lower() in {"dr", "mr", "ms", "mrs", "miss"}:
+        parts = parts[1:]
+    return parts[0] if parts else ""
+
+
+def _generate_hook(prospect: dict):
+    """Pick a hook tier and return (tier_number, formatted_hook_sentence).
+
+    Reads review and longevity data directly from Supabase columns populated
+    by enrichment_agent.py:
+      - rating (numeric)
+      - review_count (integer)
+      - years_in_business (integer)
+
+    Tier 1: rating >= 4.0 AND review_count >= 10
+    Tier 2: years_in_business >= 10
+    Tier 3: research framing fallback
+    """
+    vertical = prospect.get("cat", "")
+    hooks = _get_vertical_hook_set(vertical)  # raises if paused/unknown
+
+    business_name = _clean_business_name(prospect.get("name", "your business"))
+
+    # Pull review + years data from Supabase columns (v5.2 parsed them out of
+    # the notes string; v6 reads them directly).
+    rating = prospect.get("rating")
+    review_count = prospect.get("review_count")
+    years = prospect.get("years_in_business")
+
+    # Tier 1: credible reviews (quality + volume)
+    try:
+        if rating is not None and review_count is not None:
+            if float(rating) >= 4.0 and int(review_count) >= 10:
+                return 1, hooks["tier1"].format(
+                    rating=f"{float(rating):.1f}",
+                    reviews=int(review_count),
+                    business_name=business_name,
+                )
+    except (TypeError, ValueError):
+        pass
+
+    # Tier 2: established business (10+ years)
+    try:
+        if years is not None and int(years) >= 10:
+            return 2, hooks["tier2"].format(
+                years=int(years),
+                business_name=business_name,
+            )
+    except (TypeError, ValueError):
+        pass
+
+    # Tier 3: research framing
+    return 3, hooks["tier3"].format(business_name=business_name)
+
+
+def _build_observation(prospect: dict) -> str:
+    """Sentence 3 -- names a concrete manual-work friction.
+
+    Uses manual_work_signal verbatim when present. When empty, falls back to
+    a vertical-generic phrasing (dental: 'your current intake flow', trades:
+    'your current quote process').
+    """
+    signal = (prospect.get("manual_work_signal") or "").strip().rstrip(".")
+    if signal:
+        return f"One thing I noticed: {signal}."
+
+    vertical = prospect.get("cat", "")
+    fallback = _OBSERVATION_FALLBACK.get(vertical)
+    if fallback:
+        return (f"I poked around your site and {fallback} looks like it "
+                f"still routes through a manual step.")
+    # This path shouldn't be reached because paused verticals already raised.
+    return "I poked around your site and saw a few places a manual step could be tightened up."
+
+
+def _build_email_body(prospect: dict, tier: int, hook: str):
+    """Build the 4-sentence email body. Returns (subject, text, html).
+
+    Structure (4 sentences + greeting + sign-off):
+      1. Greeting
+      2. Hook
+      3. Observation (manual_work_signal)
+      4. Loom offer
+      sign-off: -- Franco
+    """
+    business_name = _clean_business_name(prospect.get("name", "your business"))
+    owner = (prospect.get("owner_name") or prospect.get("owner") or "").strip()
+
+    first_name = _extract_first_name(owner)
+    if first_name:
+        # Dental/medical: prefer 'Dr. Smith' if credentials suggest it
+        creds = (prospect.get("credentials") or "").upper()
+        if "DDS" in creds or "DMD" in creds or "MD" in creds:
+            # Use last name with Dr. prefix if available
+            parts = owner.split()
+            if len(parts) >= 2:
+                greeting = f"Hi Dr. {parts[-1]},"
+            else:
+                greeting = f"Hi {first_name},"
+        else:
+            greeting = f"Hi {first_name},"
+    else:
+        greeting = "Hi there,"
+
+    observation = _build_observation(prospect)
+
+    loom_offer = (
+        f"I put together a 3-minute Loom showing three specific automations "
+        f"I'd build for {business_name} -- want me to send it?"
     )
+
+    signoff = "-- Franco"
+
+    # Plain text version
+    text = (
+        f"{greeting}\n\n"
+        f"{hook}\n\n"
+        f"{observation}\n\n"
+        f"{loom_offer}\n\n"
+        f"{signoff}\n"
+    )
+
+    # HTML version (plain paragraphs, no signature block)
+    html = (
+        f"<p>{greeting}</p>\n"
+        f"<p>{hook}</p>\n"
+        f"<p>{observation}</p>\n"
+        f"<p>{loom_offer}</p>\n"
+        f"<p>{signoff}</p>\n"
+    )
+
+    subject = f"Quick question about {business_name}"
+    return subject, text, html
+
+
+def generate_email(prospect: dict):
+    """Build the v6 4-sentence cold email for a prospect. Returns a dict
+    or None if email is missing / dead-end / vertical is paused."""
+    email = (prospect.get("email") or "").strip()
+    if not email or "@" not in email:
+        return None
+    if _is_dead_end_email(email):
+        return None
+
+    try:
+        tier, hook = _generate_hook(prospect)
+    except PausedVerticalError as e:
+        print(f"    SKIP (paused vertical): {e}")
+        return None
+    except KeyError as e:
+        print(f"    SKIP (unknown vertical): {e}")
+        return None
+
+    subject, text, html = _build_email_body(prospect, tier, hook)
+
+    owner = (prospect.get("owner_name") or prospect.get("owner") or "").strip()
+    to_name = _extract_first_name(owner) or prospect.get("name", "")
+
+    return {
+        "to_email": email,
+        "to_name": to_name,
+        "subject": subject,
+        "body_text": text,
+        "body_html": html,
+        "tier": tier,
+        "hook": hook,
+        "sentence_count": 4,
+        "touch": 1,  # Day 0
+        "drafted_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# =============================================================================
+# Follow-up Sequence (Day 4 / Day 11 / Day 14)
+# =============================================================================
+
+def _days_since(ts_str):
+    """Days elapsed since an ISO timestamp. Returns None if unparseable."""
+    if not ts_str:
+        return None
+    try:
+        # Supabase returns 'YYYY-MM-DDTHH:MM:SS.ffffff+00:00' or similar
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds() / 86400.0
+    except (ValueError, AttributeError):
+        return None
+
+
+def _build_day4_email(prospect: dict):
+    """Day 4 follow-up: one-liner nudge."""
+    business_name = _clean_business_name(prospect.get("name", "your business"))
+    owner = (prospect.get("owner_name") or prospect.get("owner") or "").strip()
+    first_name = _extract_first_name(owner)
+    greeting = f"Hi {first_name}," if first_name else "Hi there,"
+
+    body = "Did my last note get buried? Happy to send that Loom over whenever works."
+    signoff = "-- Franco"
+
+    text = f"{greeting}\n\n{body}\n\n{signoff}\n"
+    html = f"<p>{greeting}</p>\n<p>{body}</p>\n<p>{signoff}</p>\n"
+
+    return {
+        "to_email": prospect.get("email"),
+        "to_name": first_name or prospect.get("name", ""),
+        "subject": f"Re: Quick question about {business_name}",
+        "body_text": text,
+        "body_html": html,
+        "touch": 2,
+        "drafted_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _build_day11_linkedin(prospect: dict):
+    """Day 11: short LinkedIn connection request for Franco to send manually."""
+    business_name = _clean_business_name(prospect.get("name", "your business"))
+    owner = (prospect.get("owner_name") or prospect.get("owner") or "").strip()
+    first_name = _extract_first_name(owner)
+
+    note = (
+        f"Hi{' ' + first_name if first_name else ''}, "
+        f"reaching out because I've been researching independent businesses "
+        f"in the GTA and {business_name} caught my eye. "
+        f"Would be great to connect."
+    )[:300]  # LinkedIn note limit is 300 chars
+
+    return {
+        "channel": "linkedin",
+        "to_name": first_name or prospect.get("name", ""),
+        "note": note,
+        "touch": 3,
+        "drafted_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _build_day14_call_sms(prospect: dict):
+    """Day 14: SMS Franco directly prompting a phone call."""
+    name = prospect.get("name", "unknown")
+    phone = prospect.get("phone", "(no phone on file)")
+    return f"Unify: Time to call {name}, {phone}"
+
+
+def run_follow_ups(max_per_day=20, dry_run=False):
+    """Sweep sent prospects for Day 4 / 11 / 14 touches."""
+    print("=" * 60)
+    print("  Unify Cold Email Agent v6 -- FOLLOW-UPS MODE")
+    print("=" * 60)
+
+    candidates = get_sent_prospects_awaiting_followup()
+    print(f"  {len(candidates)} prospects with touch_count in [1,2,3]")
+
+    gmail = None if dry_run else get_gmail_service()
+    drafted_day4 = 0
+    drafted_day11 = 0
+    sent_day14 = 0
+
+    for p in candidates:
+        pid = p.get("id")
+        touch = p.get("touch_count") or 0
+        days = _days_since(p.get("last_touch_at"))
+        if days is None:
+            continue
+
+        # Decide which follow-up (if any)
+        if touch == 1 and days >= 4.0:
+            # Day 4 email
+            if drafted_day4 >= max_per_day:
+                continue
+            email = (p.get("email") or "").strip()
+            if not email or _is_dead_end_email(email):
+                continue
+            payload = _build_day4_email(p)
+            print(f"\n  Day 4 follow-up: {p.get('name')} -> {email}")
+            if not dry_run:
+                if gmail:
+                    create_gmail_draft(gmail, payload["to_email"], payload["to_name"],
+                                       payload["subject"], payload["body_html"],
+                                       payload["body_text"])
+                insert_draft_to_queue(pid, payload, action_type="cold_email")
+            drafted_day4 += 1
+        elif touch == 2 and days >= 11.0:
+            # Day 11 LinkedIn
+            if drafted_day11 >= max_per_day:
+                continue
+            payload = _build_day11_linkedin(p)
+            print(f"\n  Day 11 LinkedIn note: {p.get('name')}")
+            if not dry_run:
+                insert_draft_to_queue(pid, payload, action_type="linkedin_note")
+            drafted_day11 += 1
+        elif touch == 3 and days >= 14.0:
+            # Day 14 SMS to Franco
+            msg = _build_day14_call_sms(p)
+            print(f"\n  Day 14 SMS: {msg}")
+            if not dry_run:
+                send_sms(msg)
+                # Bump touch_count so we don't re-notify every day
+                url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
+                requests.patch(url, headers=sb_headers(), json={
+                    "touch_count": 4,
+                    "last_touch_at": datetime.now(timezone.utc).isoformat(),
+                }, timeout=15)
+            sent_day14 += 1
+
+    print("\n" + "=" * 60)
+    print(f"  Day 4 drafts  : {drafted_day4}")
+    print(f"  Day 11 notes  : {drafted_day11}")
+    print(f"  Day 14 SMS    : {sent_day14}")
+    print("=" * 60)
+
+    if drafted_day4 + drafted_day11 + sent_day14 > 0 and not dry_run:
+        send_sms(
+            f"Unify follow-ups: {drafted_day4} Day-4 drafts, "
+            f"{drafted_day11} Day-11 LI notes, {sent_day14} Day-14 call prompts."
+        )
+
+
+# =============================================================================
+# Loom Workflow (human-in-the-loop)
+# =============================================================================
+
+def _build_loom_script(prospect: dict) -> str:
+    """Three bullet points Franco can use as a recording guide. References
+    specific enrichment data (rating, review_count, manual_work_signal,
+    years_in_business) when available."""
+    business_name = _clean_business_name(prospect.get("name", "your business"))
+    vertical = prospect.get("cat", "")
+    signal = (prospect.get("manual_work_signal") or "").strip()
+    rating = prospect.get("rating")
+    review_count = prospect.get("review_count")
+    years = prospect.get("years_in_business")
+
+    # Bullet 1: point at the specific friction from manual_work_signal
+    if signal:
+        bullet1 = (
+            f'- Open {business_name} website, point at the friction: "Right now '
+            f'{signal} -- that\'s typically 5-10 minutes of staff time per request '
+            f'that an automation can absorb."'
+        )
+    else:
+        fallback = _OBSERVATION_FALLBACK.get(vertical, "a manual step in your intake")
+        bullet1 = (
+            f'- Open {business_name} website, point at {fallback}, say: '
+            f'"This is the kind of step that adds up across a week -- and it\'s '
+            f'exactly the kind of thing I\'d build an automation for."'
+        )
+
+    # Bullet 2: reference reviews or years in business for credibility
+    if rating is not None and review_count is not None and review_count >= 5:
+        bullet2 = (
+            f'- Point at Google reviews, say: "I see you have {int(review_count)} '
+            f'reviews at {float(rating):.1f} stars -- automating a post-visit '
+            f'follow-up that invites 5-star reviews would compound that."'
+        )
+    elif years is not None and int(years) >= 5:
+        bullet2 = (
+            f'- Reference longevity: "{int(years)}+ years in the business means '
+            f'you already have patterns worth preserving -- the automation '
+            f'should work around them, not force new ones."'
+        )
+    else:
+        bullet2 = (
+            f'- Reference their independent/owner-operated status: "What I build '
+            f'is designed to slot into how you already work -- no new software '
+            f'to learn, no hire-to-operate."'
+        )
+
+    # Bullet 3: pitch the three automations (vertical-specific)
+    if vertical == "Dental & Medical":
+        three = ("appointment confirmation and reminder sequence, "
+                 "no-show recovery, review request flow")
+    elif vertical == "Trades":
+        three = ("quote-request auto-response, "
+                 "job scheduling SMS sequence, "
+                 "review request after job completion")
+    else:
+        three = ("intake automation, follow-up sequence, review capture")
+
+    bullet3 = (
+        f'- Close on: "Three automations I\'d build for you: {three}. '
+        f'Happy to walk through any of them on a quick call."'
+    )
+
+    return "\n".join([bullet1, bullet2, bullet3])
+
+
+def run_loom_scripts(dry_run=False):
+    """Poll for loom_requested entries, draft 3-bullet Loom scripts,
+    SMS Franco when one is ready to record."""
+    print("=" * 60)
+    print("  Unify Cold Email Agent v6 -- LOOM SCRIPT MODE")
+    print("=" * 60)
+
+    entries = get_loom_requested_entries()
+    print(f"  {len(entries)} loom_requested entries without scripts")
+
+    drafted = 0
+    for entry in entries:
+        prospect = entry.get("prospects") or {}
+        if not prospect:
+            continue
+        queue_id = entry.get("id")
+        name = prospect.get("name", "unknown")
+        print(f"\n  Drafting Loom script for: {name}")
+
+        script = _build_loom_script(prospect)
+        print(f"  --- Script preview ---\n{script}\n  ---")
+
+        if dry_run:
+            drafted += 1
+            continue
+
+        # Merge script into existing payload
+        existing = entry.get("payload") or {}
+        existing["loom_script"] = script
+        existing["loom_script_drafted_at"] = datetime.now(timezone.utc).isoformat()
+
+        if update_queue_payload(queue_id, existing):
+            send_sms(f"Unify: Record Loom for {name}. Script in CRM.")
+            drafted += 1
+        else:
+            print(f"    WARNING: could not write script back to queue")
+
+    if drafted == 0:
+        print("  Nothing to draft.")
+    print("\n" + "=" * 60)
+    print(f"  Loom scripts drafted: {drafted}")
+    print("=" * 60)
+
+
+def _build_loom_recorded_followup(prospect: dict, loom_link: str):
+    """Follow-up email once Franco records the Loom and pastes the link."""
+    business_name = _clean_business_name(prospect.get("name", "your business"))
+    owner = (prospect.get("owner_name") or prospect.get("owner") or "").strip()
+    first_name = _extract_first_name(owner)
+    greeting = f"Hi {first_name}," if first_name else "Hi there,"
+
+    body = f"Here's that Loom -- 3 minutes: {loom_link}"
+    callout = ("If anything in it feels worth a deeper conversation, "
+               "happy to jump on a quick call.")
+    signoff = "-- Franco"
+
+    text = f"{greeting}\n\n{body}\n\n{callout}\n\n{signoff}\n"
+    html = (
+        f"<p>{greeting}</p>\n"
+        f"<p>{body}</p>\n"
+        f"<p>{callout}</p>\n"
+        f"<p>{signoff}</p>\n"
+    )
+
+    return {
+        "to_email": prospect.get("email"),
+        "to_name": first_name or prospect.get("name", ""),
+        "subject": f"Re: Quick question about {business_name}",
+        "body_text": text,
+        "body_html": html,
+        "loom_link": loom_link,
+        "touch": 2,  # This is their second warm touch
+        "drafted_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def run_loom_recorded_followups(dry_run=False):
+    """For each loom_recorded entry with a loom_link, draft a follow-up
+    email that delivers the Loom."""
+    print("=" * 60)
+    print("  Unify Cold Email Agent v6 -- LOOM RECORDED FOLLOW-UP MODE")
+    print("=" * 60)
+
+    entries = get_prospects_for_loom_recorded()
+    print(f"  {len(entries)} loom_recorded entries with loom_link set")
+
+    gmail = None if dry_run else get_gmail_service()
+    drafted = 0
+    for entry in entries:
+        prospect = entry.get("prospects") or {}
+        loom_link = prospect.get("loom_link")
+        pid = prospect.get("id")
+        if not loom_link or not pid:
+            continue
+
+        payload = _build_loom_recorded_followup(prospect, loom_link)
+        print(f"\n  Drafting Loom delivery: {prospect.get('name')} -> {payload['to_email']}")
+        if dry_run:
+            drafted += 1
+            continue
+
+        if gmail:
+            create_gmail_draft(gmail, payload["to_email"], payload["to_name"],
+                               payload["subject"], payload["body_html"],
+                               payload["body_text"])
+        # Insert as new queue entry so the approval flow is identical to Day-0
+        insert_draft_to_queue(pid, payload, action_type="loom_delivery")
+        # Flip the original loom_recorded entry so we don't re-draft
+        update_queue_status(entry.get("id"), "loom_delivered")
+        drafted += 1
+
+    print("\n" + "=" * 60)
+    print(f"  Loom delivery drafts: {drafted}")
+    print("=" * 60)
+
+
+# =============================================================================
+# Draft Mode (Day 0)
+# =============================================================================
+
+def _clear_cold_email_queue():
+    """Delete all cold_email entries from agent_queue (for --redraft)."""
+    url = f"{SUPABASE_URL}/rest/v1/agent_queue?action_type=eq.cold_email"
     r = requests.delete(url, headers=sb_headers(), timeout=15)
     if r.status_code in (200, 204):
         print("  Cleared old cold_email entries from agent_queue")
         return True
-    else:
-        print(f"  WARNING: Could not clear agent_queue ({r.status_code})")
-        return False
+    print(f"  WARNING: Could not clear agent_queue ({r.status_code})")
+    return False
 
 
-def run_draft(max_drafts=20, dry_run=False, redraft=False):
-    """
-    DRAFT MODE — generates email drafts from already-enriched data.
-    Enrichment is handled separately by enrichment_agent.py.
-    If redraft=True, clears old queue entries and regenerates all drafts.
-    """
+def _draft_one(prospect, gmail, dry_run):
+    """Draft a single cold email for a prospect. Returns (ok, tier)."""
+    pid = prospect.get("id", "unknown")
+    name = prospect.get("name", "Unknown")
+    email = prospect.get("email", "")
+    owner = (prospect.get("owner_name") or prospect.get("owner") or "").strip() or "(no name)"
+
+    print(f"\n  Drafting for: {name} ({owner}) -> {email}")
+
+    email_data = generate_email(prospect)
+    if not email_data:
+        return False, None
+
+    # Acceptance sanity check: 4 sentences in body
+    # (greeting + hook + observation + loom_offer, sign-off is sentence-level
+    # too but conventionally excluded -- count the hook/observation/loom body)
+    body_sentences = [ln for ln in email_data["body_text"].split("\n") if ln.strip()]
+    # greeting, hook, observation, loom_offer, signoff = 5 non-empty lines
+    if len(body_sentences) != 5:
+        print(f"    Warning: email has {len(body_sentences)} lines, expected 5")
+
+    if dry_run:
+        print(f"    [DRY RUN] Subject: {email_data['subject']}")
+        print(f"    [DRY RUN] Tier: {email_data['tier']}")
+        print(f"    [DRY RUN] Body:\n{'-'*60}\n{email_data['body_text']}{'-'*60}")
+        return True, email_data["tier"]
+
+    gmail_ok = False
+    if gmail:
+        gmail_ok = create_gmail_draft(
+            gmail,
+            email_data["to_email"],
+            email_data["to_name"],
+            email_data["subject"],
+            email_data["body_html"],
+            email_data["body_text"],
+        )
+
+    insert_draft_to_queue(pid, email_data, action_type="cold_email")
+
+    # Move status NOT CONTACTED -> PHONE CALL READY (same as v5.2)
+    patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
+    requests.patch(patch_url, headers=sb_headers(), json={
+        "status": "PHONE CALL READY",
+        "action": "Email drafted -- review in Gmail, then send or call",
+    }, timeout=15)
+
+    print(f"    Tier {email_data['tier']} -- saved to "
+          f"{'Gmail+queue' if gmail_ok else 'queue only'}")
+    return True, email_data["tier"]
+
+
+def run_draft(max_drafts=50, dry_run=False, redraft=False):
+    """Day-0 draft mode, priority-ordered: high first, medium second, low skipped."""
     mode_label = "REDRAFT MODE" if redraft else "DRAFT MODE"
     print("=" * 60)
-    print(f"  Unify Cold Email Agent v5.2 -- {mode_label}")
+    print(f"  Unify Cold Email Agent v6 -- {mode_label}")
     print("=" * 60)
     print(f"  Max drafts  : {max_drafts}")
     print(f"  Dry run     : {dry_run}")
-    print(f"  Redraft     : {redraft}")
     print(f"  Supabase    : {'Connected' if SUPABASE_KEY else 'No key'}")
-    print(f"  Gmail       : Checking...")
     print()
 
-    # If redraft, reset stages and clear old queue entries
     if redraft and not dry_run:
-        # Reset "PHONE CALL READY" prospects back to "NOT CONTACTED"
-        reset_url = (
-            f"{SUPABASE_URL}/rest/v1/prospects"
-            f"?status=eq.PHONE CALL READY"
-        )
-        r = requests.patch(reset_url, headers=sb_headers(),
+        reset_url = f"{SUPABASE_URL}/rest/v1/prospects?status=eq.PHONE CALL READY"
+        r = requests.patch(reset_url, headers=sb_headers(return_representation=True),
                            json={"status": "NOT CONTACTED", "action": None},
                            timeout=15)
         if r.status_code in (200, 204):
             reset_count = len(r.json()) if r.text.strip() else 0
-            print(f"  Reset {reset_count} prospects from PHONE CALL READY -> NOT CONTACTED")
-        else:
-            print(f"  WARNING: Could not reset stages ({r.status_code}: {r.text[:200]})")
+            print(f"  Reset {reset_count} prospects PHONE CALL READY -> NOT CONTACTED")
         _clear_cold_email_queue()
 
-    # Set up Gmail
     gmail = None
     if not dry_run:
         gmail = get_gmail_service()
-        if gmail:
-            print("  Gmail       : Connected")
-        else:
-            print("  Gmail       : NOT connected -- drafts will only go to agent_queue")
+        print(f"  Gmail       : {'Connected' if gmail else 'NOT connected'}")
 
-    # =========================================================================
-    # Draft emails for ALL prospects with email addresses
-    # Owner name preferred but not required — "Hi there" fallback
-    # =========================================================================
-    print("\n" + "-" * 60)
-    print("  Drafting cold emails (email = only hard filter)")
-    print("-" * 60)
+    existing_ids = set() if redraft else get_existing_queue_ids(("cold_email",))
 
-    prospects = get_prospects_to_email(redraft=redraft)
-    if not redraft:
-        existing_ids = get_existing_queue_ids()
-        prospects = [p for p in prospects if p.get("id") not in existing_ids]
-
-    print(f"  {len(prospects)} prospects ready for email drafts")
-
+    counts = {"high": 0, "medium": 0, "tier1": 0, "tier2": 0, "tier3": 0}
     drafted = 0
 
-    for prospect in prospects:
+    # Priority-ordered: high first, medium second, low skipped
+    for priority in ("high", "medium"):
         if drafted >= max_drafts:
-            print(f"\n  DAILY CAP REACHED: {drafted} drafts")
             break
+        prospects = get_prospects_by_priority(priority, redraft=redraft)
+        prospects = [p for p in prospects if p.get("id") not in existing_ids]
+        print(f"\n  --- {priority.upper()} priority: {len(prospects)} prospects "
+              f"ready ---")
 
-        pid = prospect.get("id", "unknown")
-        name = prospect.get("name", "Unknown")
-        email = prospect.get("email", "")
-        owner = prospect.get("owner", "")
-
-        print(f"\n  Drafting for: {name} ({owner}) -> {email}")
-
-        email_data = generate_email(prospect)
-        if not email_data:
-            print(f"    Skipped: could not generate email")
-            continue
-
-        if dry_run:
-            print(f"    [DRY RUN] Subject: {email_data['subject']}")
-            print(f"    [DRY RUN] To: {email_data['to_email']}")
+        for prospect in prospects:
+            if drafted >= max_drafts:
+                print(f"\n  DAILY CAP REACHED: {drafted} drafts")
+                break
+            ok, tier = _draft_one(prospect, gmail, dry_run)
+            if not ok:
+                continue
             drafted += 1
-            continue
+            counts[priority] += 1
+            if tier in (1, 2, 3):
+                counts[f"tier{tier}"] += 1
 
-        # Save to Gmail drafts
-        gmail_ok = False
-        if gmail:
-            gmail_ok = create_gmail_draft(
-                gmail,
-                email_data["to_email"],
-                email_data["to_name"],
-                email_data["subject"],
-                email_data["body_html"],
-                email_data["body_text"],
-            )
+    # Low priority is skipped entirely per spec
+    low = get_prospects_by_priority("low", redraft=redraft)
+    if low:
+        print(f"\n  --- LOW priority: {len(low)} prospects SKIPPED (per v6 spec) ---")
 
-        # Also save to agent_queue for tracking
-        insert_draft_to_queue(pid, email_data)
-
-        # Move prospect from "Not Contacted" -> "Phone Call Ready"
-        patch_url = f"{SUPABASE_URL}/rest/v1/prospects?id=eq.{pid}"
-        requests.patch(patch_url, headers=sb_headers(), json={
-            "status": "PHONE CALL READY",
-            "action": "Email drafted -- review in Gmail, then call",
-        }, timeout=15)
-
-        if gmail_ok:
-            drafted += 1
-            print(f"    Saved to Gmail + queue — status -> Phone Call Ready")
-        else:
-            drafted += 1
-            print(f"    Saved to queue — status -> Phone Call Ready (Gmail unavailable)")
-
-    # =========================================================================
-    # SUMMARY + SMS
-    # =========================================================================
     print("\n" + "=" * 60)
-    print(f"  Unify Cold Email Agent -- Draft Complete")
-    print(f"  {'='*56}")
-    print(f"     Email drafts       : {drafted}")
-    print(f"     Saved to Gmail     : {'Yes' if gmail else 'No (token missing)'}")
+    print(f"  Drafts total         : {drafted}")
+    print(f"  High-priority drafts : {counts['high']}")
+    print(f"  Medium drafts        : {counts['medium']}")
+    print(f"  Tier distribution    : T1={counts['tier1']} "
+          f"T2={counts['tier2']} T3={counts['tier3']}")
     print("=" * 60)
 
     if drafted > 0:
         msg = (
-            f"Unify: {drafted} new leads ready to be called. "
-            f"Emails drafted in your Gmail -- review, send, and call."
+            f"Unify: {drafted} cold email drafts ready "
+            f"({counts['high']} high, {counts['medium']} medium). "
+            f"Review at {CRM_URL}"
         )
     else:
-        msg = (
-            f"Unify: 0 new drafts this run. "
-            f"All prospects either already drafted or no email available."
-        )
+        msg = f"Unify: 0 new drafts this run. All priority prospects already drafted."
 
-    print(f"\n  Notifying Franco...")
     if not dry_run:
         send_sms(msg)
     else:
         print(f"  [DRY RUN] SMS: {msg}")
-
     print("\n  Done.")
 
 
-# ==============================================================================
-# SEND MODE — Send approved emails via Resend
-# ==============================================================================
+# =============================================================================
+# Send Mode
+# =============================================================================
 
 def run_send(dry_run=False):
-    """Send approved emails from agent_queue via Resend API."""
+    """Send approved emails via Resend. Uses mark_sent() so the DB trigger
+    bumps touch_count + last_touch_at atomically."""
     print("=" * 60)
-    print("  Unify Cold Email Agent v5.2 -- SEND MODE")
+    print("  Unify Cold Email Agent v6 -- SEND MODE")
     print("=" * 60)
-    print(f"  Resend : {'Configured' if RESEND_API_KEY else 'No key'}")
-    print(f"  Sender : {SENDER_EMAIL}")
-    print()
 
     if not RESEND_API_KEY and not dry_run:
         print("  ERROR: RESEND_API_KEY not configured.")
@@ -524,74 +1151,77 @@ def run_send(dry_run=False):
         return
 
     approved = get_approved_emails()
-    print(f"  Found {len(approved)} approved emails to send")
-
+    print(f"  {len(approved)} approved emails to send")
     if not approved:
-        msg = "Unify: 0 approved emails to send. Approve drafts first."
-        print(f"\n  {msg}")
-        if not dry_run:
-            send_sms(msg)
+        send_sms("Unify: 0 approved emails to send. Approve drafts first.")
         return
 
     sent = 0
     failed = 0
-
     for item in approved:
         payload = item.get("payload", {})
         queue_id = item.get("id")
         prospect_id = item.get("prospect_id")
-
         to_email = payload.get("to_email", "")
-        to_name = payload.get("to_name", "")
-        subject = payload.get("subject", "")
-        body_html = payload.get("body_html", "")
-        body_text = payload.get("body_text", "")
 
-        print(f"\n  Sending: {subject} -> {to_email}")
-
+        print(f"\n  Sending -> {to_email}")
         if dry_run:
-            print(f"    [DRY RUN] Would send")
             sent += 1
             continue
-
-        if send_email_via_resend(to_email, to_name, subject, body_html, body_text):
-            update_queue_status(queue_id, "sent")
-            update_prospect_after_send(prospect_id)
+        ok = send_email_via_resend(
+            to_email, payload.get("to_name", ""),
+            payload.get("subject", ""),
+            payload.get("body_html", ""),
+            payload.get("body_text", ""),
+        )
+        if ok:
+            mark_sent(queue_id, prospect_id)
             sent += 1
         else:
             failed += 1
-
         time.sleep(2)
 
-    if sent > 0:
-        msg = f"Unify: {sent} cold emails sent! {failed} failed."
-    else:
-        msg = f"Unify: 0 emails sent. {failed} failed."
-
     if not dry_run:
-        send_sms(msg)
-
+        send_sms(f"Unify: {sent} cold emails sent, {failed} failed.")
     print(f"\n  Done. {sent} sent, {failed} failed.")
 
 
-# -- CLI ----------------------------------------------------------------------
+# =============================================================================
+# CLI
+# =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Unify Cold Email Agent v5.2")
+    parser = argparse.ArgumentParser(description="Unify Cold Email Agent v6 (Loom Pivot)")
     parser.add_argument("--draft", action="store_true",
-                        help="Generate email drafts in Gmail (no enrichment)")
+                        help="Draft Day-0 emails, priority-ordered")
     parser.add_argument("--redraft", action="store_true",
-                        help="Clear old drafts from queue and regenerate all emails")
+                        help="Clear queue + redraft everything")
+    parser.add_argument("--follow-ups", action="store_true", dest="follow_ups",
+                        help="Day 4/11/14 follow-up sweep")
+    parser.add_argument("--loom-script", action="store_true", dest="loom_script",
+                        help="Draft 3-bullet Loom scripts for loom_requested entries")
+    parser.add_argument("--loom-recorded", action="store_true", dest="loom_recorded",
+                        help="Draft follow-up emails for loom_recorded entries")
     parser.add_argument("--send", action="store_true",
                         help="Send approved emails via Resend")
-    parser.add_argument("--max", "-m", type=int, default=20,
-                        help="Max items per run (default: 20)")
+    parser.add_argument("--mark-sent", type=str, dest="mark_sent",
+                        help="Manually flip a queue entry to 'sent' by id")
+    parser.add_argument("--max", "-m", type=int, default=50,
+                        help="Max items per run (default: 50)")
     parser.add_argument("--dry-run", "-d", action="store_true",
-                        help="Preview without writing to DB, Gmail, or sending")
+                        help="Preview without writing")
     args = parser.parse_args()
 
-    if not args.draft and not args.send and not args.redraft:
-        print("Error: Must specify --draft, --redraft, or --send")
+    if args.mark_sent:
+        ok = mark_sent(args.mark_sent)
+        print(f"  mark_sent({args.mark_sent}): {'OK' if ok else 'FAILED'}")
+        return
+
+    modes = [args.draft, args.redraft, args.follow_ups, args.loom_script,
+             args.loom_recorded, args.send]
+    if not any(modes):
+        print("Error: must specify --draft / --redraft / --follow-ups / "
+              "--loom-script / --loom-recorded / --send / --mark-sent")
         parser.print_help()
         sys.exit(1)
 
@@ -599,6 +1229,12 @@ def main():
         run_draft(max_drafts=args.max, dry_run=args.dry_run, redraft=True)
     elif args.draft:
         run_draft(max_drafts=args.max, dry_run=args.dry_run)
+    elif args.follow_ups:
+        run_follow_ups(max_per_day=args.max, dry_run=args.dry_run)
+    elif args.loom_script:
+        run_loom_scripts(dry_run=args.dry_run)
+    elif args.loom_recorded:
+        run_loom_recorded_followups(dry_run=args.dry_run)
     elif args.send:
         run_send(dry_run=args.dry_run)
 
