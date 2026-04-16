@@ -1,33 +1,27 @@
 #!/usr/bin/env python3
 """
-Unify Lead Sourcer Agent v2.1
+Unify Lead Sourcer Agent v3.0
 ================================
-Multi-source lead sourcing across the GTA. Scrapes:
-  - YellowPages.ca (primary — most reliable)
-  - Google Maps (via Google search results page scraping)
-  - Yelp.ca
-  - Bing Places
-  - BBB (Better Business Bureau)
-  - 411.ca
+YellowPages.ca-only lead sourcing with manual-work scoring.
 
-v2.1 Upgrades:
-  - Circuit breaker: auto-disables sources after 3 consecutive failures
-  - Smart area selection: fewer areas for niche verticals
-  - Better delays + retry with backoff for Google 429s
-  - Improved contact name extraction (team pages, structured data, og tags)
-  - Fixed Supabase column names (stage, opportunity, next_action)
-  - Slugified prospect IDs
-  - Always sends SMS (even if 0 leads)
-  - Run summary stats in SMS
-
-RULE: Never source a lead without an owner/contact name.
+v3.0 Changes:
+  - Dropped all dead sources (Google, Yelp, Bing, BBB, 411.ca)
+  - Narrowed to Dental & Medical + Trades verticals
+  - Added manual-work scoring (0-10) per prospect via homepage + Places API
+  - Score < 3 -> skip; 3-5 -> medium priority; 6+ -> high priority
+  - Removed AI gap descriptions (opp field no longer set at source time)
+  - Removed owner-name hard filter (no name is fine if phone/email exists)
+  - Dedup by slug ID instead of name
+  - Circuit breaker + retry for YellowPages
+  - New SMS format with priority breakdown
 
 Usage:
-    python lead_sourcer.py                     # Run with defaults
-    python lead_sourcer.py --vertical Restaurants --area "Brampton, ON" --max 10
-    python lead_sourcer.py --dry-run           # Preview without writing to DB
+    python lead_sourcer.py                             # Dental + Trades (default)
+    python lead_sourcer.py --vertical "Dental & Medical" --area "Brampton, ON"
+    python lead_sourcer.py --dry-run                   # Preview without DB writes
+    python lead_sourcer.py --max 10                    # Max results per YP search
 
-Requires env vars or .env file -- see .env.template
+Requires env vars: SUPABASE_URL, SUPABASE_KEY, TWILIO_*, GOOGLE_PLACES_API_KEY (optional)
 """
 
 import os, sys, re, json, time, random, argparse
@@ -52,27 +46,21 @@ def load_env(path=".env"):
 
 load_env()
 
-SUPABASE_URL  = os.getenv("SUPABASE_URL", "https://alfzjwzeccqswtytcylo.supabase.co")
-SUPABASE_KEY  = os.getenv("SUPABASE_KEY", "")
-TWILIO_SID    = os.getenv("TWILIO_SID", "")
-TWILIO_TOKEN  = os.getenv("TWILIO_TOKEN", "")
-TWILIO_FROM   = os.getenv("TWILIO_FROM", "")
-FRANCO_PHONE  = os.getenv("FRANCO_PHONE", "")
+SUPABASE_URL          = os.getenv("SUPABASE_URL", "https://alfzjwzeccqswtytcylo.supabase.co")
+SUPABASE_KEY          = os.getenv("SUPABASE_KEY", "")
+TWILIO_SID            = os.getenv("TWILIO_SID", "")
+TWILIO_TOKEN          = os.getenv("TWILIO_TOKEN", "")
+TWILIO_FROM           = os.getenv("TWILIO_FROM", "")
+FRANCO_PHONE          = os.getenv("FRANCO_PHONE", "")
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 
 # -- Search Parameters --------------------------------------------------------
 
 VERTICALS = {
-    "Restaurants": [
-        "restaurant", "cafe", "bakery", "pizzeria", "sushi restaurant",
-        "bar and grill", "catering", "food truck", "diner", "bistro",
-        "brunch spot", "steakhouse", "thai restaurant", "indian restaurant",
-        "italian restaurant", "mexican restaurant", "bbq restaurant",
-    ],
-    "Retail": [
-        "boutique", "clothing store", "gift shop", "jewelry store",
-        "pet store", "florist", "furniture store", "shoe store",
-        "home decor store", "sporting goods store", "vintage shop",
-        "bridal shop", "optical store", "luggage store",
+    "Dental & Medical": [
+        "dentist", "dental clinic", "chiropractor", "physiotherapy clinic",
+        "optometrist", "veterinary clinic", "walk-in clinic",
+        "dermatologist", "orthodontist", "massage therapy clinic",
     ],
     "Trades": [
         "plumber", "electrician", "HVAC contractor", "roofing contractor",
@@ -81,40 +69,57 @@ VERTICALS = {
         "pest control", "tree service", "pool company", "paving contractor",
         "foundation repair", "waterproofing company", "septic service",
     ],
-    "Dental & Medical": [
-        "dentist", "dental clinic", "chiropractor", "physiotherapy clinic",
-        "optometrist", "veterinary clinic", "walk-in clinic",
-        "dermatologist", "orthodontist", "massage therapy clinic",
-    ],
-    "Salons & Spas": [
-        "hair salon", "barbershop", "nail salon", "med spa",
-        "beauty salon", "tanning salon", "day spa", "waxing studio",
-        "lash studio", "tattoo shop",
-    ],
-    "Professional Services": [
-        "law firm", "accounting firm", "insurance agency",
-        "real estate agency", "mortgage broker", "financial advisor",
-        "tax preparation", "notary public", "immigration consultant",
-    ],
-    "Fitness & Wellness": [
-        "gym", "fitness studio", "yoga studio", "pilates studio",
-        "crossfit gym", "martial arts studio", "personal training",
-        "dance studio", "swimming school",
-    ],
-    "Auto Services": [
-        "auto repair shop", "car detailing", "tire shop",
-        "auto body shop", "oil change", "car wash",
-        "transmission repair", "muffler shop",
-    ],
-    "Cleaning & Property": [
-        "cleaning company", "janitorial service", "carpet cleaning",
-        "window cleaning company", "property management company",
-        "moving company", "junk removal", "storage facility",
-    ],
+    # v3 narrow focus: dental + trades only
+    # "Restaurants": [
+    #     "restaurant", "cafe", "bakery", "pizzeria", "sushi restaurant",
+    #     "bar and grill", "catering", "food truck", "diner", "bistro",
+    #     "brunch spot", "steakhouse", "thai restaurant", "indian restaurant",
+    #     "italian restaurant", "mexican restaurant", "bbq restaurant",
+    # ],
+    # v3 narrow focus: dental + trades only
+    # "Retail": [
+    #     "boutique", "clothing store", "gift shop", "jewelry store",
+    #     "pet store", "florist", "furniture store", "shoe store",
+    #     "home decor store", "sporting goods store", "vintage shop",
+    #     "bridal shop", "optical store", "luggage store",
+    # ],
+    # v3 narrow focus: dental + trades only
+    # "Salons & Spas": [
+    #     "hair salon", "barbershop", "nail salon", "med spa",
+    #     "beauty salon", "tanning salon", "day spa", "waxing studio",
+    #     "lash studio", "tattoo shop",
+    # ],
+    # v3 narrow focus: dental + trades only
+    # "Professional Services": [
+    #     "law firm", "accounting firm", "insurance agency",
+    #     "real estate agency", "mortgage broker", "financial advisor",
+    #     "tax preparation", "notary public", "immigration consultant",
+    # ],
+    # v3 narrow focus: dental + trades only
+    # "Fitness & Wellness": [
+    #     "gym", "fitness studio", "yoga studio", "pilates studio",
+    #     "crossfit gym", "martial arts studio", "personal training",
+    #     "dance studio", "swimming school",
+    # ],
+    # v3 narrow focus: dental + trades only
+    # "Auto Services": [
+    #     "auto repair shop", "car detailing", "tire shop",
+    #     "auto body shop", "oil change", "car wash",
+    #     "transmission repair", "muffler shop",
+    # ],
+    # v3 narrow focus: dental + trades only
+    # "Cleaning & Property": [
+    #     "cleaning company", "janitorial service", "carpet cleaning",
+    #     "window cleaning company", "property management company",
+    #     "moving company", "junk removal", "storage facility",
+    # ],
 }
 
+# Active verticals for v3
+ACTIVE_VERTICALS = ["Dental & Medical", "Trades"]
+
 # -- Smart Area Selection per Vertical ----------------------------------------
-# High-volume verticals get all 55 areas. Niche verticals get fewer to save time.
+# Both active verticals use FULL (all 55 areas) in v3.
 
 GTA_AREAS_FULL = [
     # Core Toronto
@@ -158,16 +163,10 @@ GTA_AREAS_SMALL = [
     "Barrie, ON", "Kitchener, ON", "Guelph, ON",
 ]
 
+# v3: both active verticals use FULL
 VERTICAL_AREA_MAP = {
-    "Restaurants": GTA_AREAS_FULL,
-    "Retail": GTA_AREAS_FULL,
+    "Dental & Medical": GTA_AREAS_FULL,
     "Trades": GTA_AREAS_FULL,
-    "Dental & Medical": GTA_AREAS_CORE,
-    "Salons & Spas": GTA_AREAS_CORE,
-    "Professional Services": GTA_AREAS_CORE,
-    "Fitness & Wellness": GTA_AREAS_SMALL,
-    "Auto Services": GTA_AREAS_SMALL,
-    "Cleaning & Property": GTA_AREAS_SMALL,
 }
 
 HEADERS = {
@@ -333,44 +332,45 @@ def slugify(text):
     return text.strip('-')[:80]
 
 
-# -- Circuit Breaker ----------------------------------------------------------
+# -- Circuit Breaker (YellowPages) --------------------------------------------
 
-class SourceCircuitBreaker:
+class YPCircuitBreaker:
     """
-    Tracks consecutive errors per source. After MAX_ERRORS consecutive
-    failures, disables the source for the rest of the run.
+    Tracks consecutive YP failures. After MAX_ERRORS consecutive failures,
+    pauses for 5 minutes, tries once more. If that fails too, signals abort.
     """
     MAX_ERRORS = 3
+    PAUSE_SECONDS = 300  # 5 minutes
 
     def __init__(self):
-        self.errors = {}    # source_name -> consecutive error count
-        self.disabled = {}  # source_name -> True/False
-        self.total_calls = {}
-        self.total_successes = {}
+        self.consecutive_errors = 0
+        self.total_calls = 0
+        self.total_successes = 0
+        self.paused_once = False
+        self.should_abort = False
 
-    def is_disabled(self, source_name):
-        return self.disabled.get(source_name, False)
+    def record_success(self, result_count):
+        self.consecutive_errors = 0
+        self.total_calls += 1
+        self.total_successes += 1
 
-    def record_success(self, source_name, result_count):
-        self.errors[source_name] = 0
-        self.total_calls[source_name] = self.total_calls.get(source_name, 0) + 1
-        self.total_successes[source_name] = self.total_successes.get(source_name, 0) + 1
-
-    def record_failure(self, source_name, reason=""):
-        self.errors[source_name] = self.errors.get(source_name, 0) + 1
-        self.total_calls[source_name] = self.total_calls.get(source_name, 0) + 1
-        if self.errors[source_name] >= self.MAX_ERRORS:
-            self.disabled[source_name] = True
-            print(f"   [CIRCUIT BREAKER] {source_name} disabled after {self.MAX_ERRORS} consecutive failures ({reason})")
+    def record_failure(self, reason=""):
+        self.consecutive_errors += 1
+        self.total_calls += 1
+        if self.consecutive_errors >= self.MAX_ERRORS:
+            if not self.paused_once:
+                print(f"   [CIRCUIT BREAKER] YP hit {self.MAX_ERRORS} consecutive failures ({reason})")
+                print(f"   [CIRCUIT BREAKER] Pausing {self.PAUSE_SECONDS}s before one more attempt...")
+                time.sleep(self.PAUSE_SECONDS)
+                self.paused_once = True
+                self.consecutive_errors = 0  # reset for the retry attempt
+            else:
+                print(f"   [CIRCUIT BREAKER] YP failed again after pause -- aborting run")
+                self.should_abort = True
 
     def summary(self):
-        lines = []
-        for src in sorted(self.total_calls.keys()):
-            total = self.total_calls.get(src, 0)
-            ok = self.total_successes.get(src, 0)
-            status = "DISABLED" if self.disabled.get(src) else "OK"
-            lines.append(f"{src}: {ok}/{total} [{status}]")
-        return ", ".join(lines)
+        status = "ABORTED" if self.should_abort else "OK"
+        return f"YP: {self.total_successes}/{self.total_calls} [{status}]"
 
 
 # -- Supabase Helpers ---------------------------------------------------------
@@ -383,12 +383,12 @@ def sb_headers():
         "Prefer": "return=minimal",
     }
 
-def sb_get_existing_names():
-    """Fetch all existing prospect names for dedup."""
-    url = f"{SUPABASE_URL}/rest/v1/prospects?select=name"
+def sb_get_existing_ids():
+    """Fetch all existing prospect IDs (slug strings) for dedup."""
+    url = f"{SUPABASE_URL}/rest/v1/prospects?select=id"
     r = requests.get(url, headers=sb_headers(), timeout=15)
     if r.status_code == 200:
-        return {row["name"].strip().lower() for row in r.json()}
+        return {row["id"] for row in r.json()}
     print(f"  Warning: Could not fetch existing prospects: {r.status_code}")
     return set()
 
@@ -428,7 +428,7 @@ def send_sms(body):
 
 
 # ==============================================================================
-# SOURCE 1: YellowPages.ca (PRIMARY — most reliable)
+# YellowPages.ca Scraper (the ONLY source in v3)
 # ==============================================================================
 
 YP_SEARCH_TERMS = {
@@ -444,550 +444,487 @@ YP_SEARCH_TERMS = {
 }
 
 def scrape_yellowpages(search_term, area, max_results=10):
-    """Scrape YellowPages.ca for business listings."""
+    """
+    Scrape YellowPages.ca for business listings.
+    Returns list of dicts with name, address, phone, website, snippet, source.
+    On 429/timeout: waits 30-60s random, retries once.
+    """
     results = []
     location = area.replace(", ", "+").replace(" ", "+")
     url = f"https://www.yellowpages.ca/search/si/1/{quote_plus(search_term)}/{location}"
 
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        html = r.text
-        print(f"     [YP] response: {r.status_code}, {len(html)} chars")
-
-        soup = BeautifulSoup(html, "lxml")
-        listings = soup.select("div.listing, div.listing__content, div[class*='listing']")
-        if not listings:
-            listings = soup.select("div.resultList div, div.result")
-
-        for listing in listings[:max_results]:
-            name_el = listing.select_one(
-                "a.listing__name--link, h3.listing__name, "
-                "a[class*='listing__name'], span.listing__name, h2 a, h3 a"
-            )
-            if not name_el:
-                continue
-            raw_name = name_el.get_text(strip=True)
-            if not raw_name or len(raw_name) < 3:
-                continue
-
-            name = clean_business_name(raw_name)
-            if not name or is_chain_or_franchise(name):
-                if name:
-                    print(f"   [YP] Filtered chain: {name}")
-                continue
-
-            # Address
-            addr_el = listing.select_one(
-                "span.listing__address--full, span[class*='address'], "
-                "div.listing__address, span.adr"
-            )
-            address = addr_el.get_text(strip=True) if addr_el else ""
-
-            # Phone
-            phone = ""
-            phone_el = listing.select_one(
-                "a[class*='phone'], span[class*='phone'], "
-                "a[data-phone], a[href^='tel:'], "
-                "span.mlr__sub-text, li.mlr__item--phone, span.listing__phone"
-            )
-            if phone_el:
-                tel_href = phone_el.get("href", "")
-                if tel_href.startswith("tel:"):
-                    phone = tel_href.replace("tel:", "").strip()
-                elif phone_el.get("data-phone"):
-                    phone = phone_el.get("data-phone")
-                else:
-                    phone = phone_el.get_text(strip=True)
-            if not phone:
-                for a in listing.select("a[href^='tel:']"):
-                    tel = a.get("href", "").replace("tel:", "").strip()
-                    if len(tel) >= 10:
-                        phone = tel
-                        break
-            if not phone:
-                all_text = listing.get_text(" ", strip=True)
-                phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', all_text)
-                if phone_match:
-                    phone = phone_match.group(1)
-            phone = re.sub(r'[^\d+()-.\s]', '', phone).strip()
-
-            # Website
-            website = ""
-            web_el = listing.select_one(
-                "a[class*='website'], a[data-analytics='website'], a.listing__link--website"
-            )
-            if web_el:
-                website = web_el.get("href", "")
-            if not website:
-                for a in listing.select("a[href^='http']"):
-                    href = a.get("href", "")
-                    if "yellowpages.ca" not in href and "ypcdn" not in href:
-                        website = href
-                        break
-
-            # Category / snippet
-            cat_el = listing.select_one("span[class*='category'], div[class*='category']")
-            snippet = cat_el.get_text(strip=True) if cat_el else ""
-
-            results.append({
-                "name": name, "address": address, "phone": phone,
-                "website": website, "snippet": snippet[:200], "source": "YellowPages"
-            })
-
-    except Exception as e:
-        print(f"  [YP] scrape error: {e}")
-
-    return results
-
-
-# ==============================================================================
-# SOURCE 2: Google Maps (with retry on 429)
-# ==============================================================================
-
-def scrape_google_maps(search_term, area, max_results=10):
-    """
-    Scrape Google search results for local businesses.
-    Includes retry with backoff on 429 Too Many Requests.
-    """
-    results = []
-    query = f"{search_term} near {area}"
-    url = f"https://www.google.com/search?q={quote_plus(query)}&num=20&gl=ca&hl=en"
-
     max_attempts = 2
     for attempt in range(max_attempts):
         try:
-            headers = {**HEADERS, "Accept": "text/html,application/xhtml+xml"}
-            r = requests.get(url, headers=headers, timeout=15)
+            r = requests.get(url, headers=HEADERS, timeout=15)
 
             if r.status_code == 429:
                 if attempt < max_attempts - 1:
                     wait = random.uniform(30, 60)
-                    print(f"     [Google] 429 rate limited — waiting {wait:.0f}s and retrying...")
+                    print(f"     [YP] 429 rate limited -- waiting {wait:.0f}s and retrying...")
                     time.sleep(wait)
                     continue
                 else:
-                    print(f"     [Google] 429 rate limited — giving up after retry")
+                    print(f"     [YP] 429 rate limited -- giving up after retry")
                     raise Exception("429 Too Many Requests")
 
             r.raise_for_status()
             html = r.text
-            print(f"     [Google] response: {r.status_code}, {len(html)} chars")
+            print(f"     [YP] response: {r.status_code}, {len(html)} chars")
 
             soup = BeautifulSoup(html, "lxml")
-            local_results = soup.select("div.VkpGBb, div[data-local-attribute], div.rllt__details")
+            listings = soup.select("div.listing, div.listing__content, div[class*='listing']")
+            if not listings:
+                listings = soup.select("div.resultList div, div.result")
 
-            for item in local_results[:max_results]:
-                name_el = item.select_one("div.dbg0pd, span.OSrXXb, div[role='heading']")
-                if not name_el:
-                    name_el = item.select_one("a[data-ved]")
-                if not name_el:
-                    continue
-
-                name = clean_business_name(name_el.get_text(strip=True))
-                if not name or len(name) < 3 or is_chain_or_franchise(name):
-                    continue
-
-                address = ""
-                addr_candidates = item.select("span, div.rllt__details div")
-                for ac in addr_candidates:
-                    txt = ac.get_text(strip=True)
-                    if re.search(r'(ON|Ontario|\d{3}\s*\w{3}|Street|Ave|Rd|Dr|Blvd)', txt, re.I):
-                        address = txt
-                        break
-
-                phone = ""
-                all_text = item.get_text(" ", strip=True)
-                phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', all_text)
-                if phone_match:
-                    phone = phone_match.group(1)
-
-                website = ""
-                for a in item.select("a[href^='http']"):
-                    href = a.get("href", "")
-                    if "google.com" not in href and "gstatic" not in href:
-                        website = href
-                        break
-
-                results.append({
-                    "name": name, "address": address, "phone": phone,
-                    "website": website, "snippet": "", "source": "Google"
-                })
-
-            if not results:
-                for div in soup.select("div.g, div[data-sokoban-container]")[:max_results]:
-                    title_el = div.select_one("h3")
-                    if not title_el:
-                        continue
-                    name = clean_business_name(title_el.get_text(strip=True))
-                    if not name or len(name) < 3 or is_chain_or_franchise(name):
-                        continue
-
-                    link_el = div.select_one("a[href^='http']")
-                    website = link_el.get("href", "") if link_el else ""
-                    if "google.com" in website:
-                        website = ""
-
-                    snippet_el = div.select_one("div.VwiC3b, span.st")
-                    snippet = snippet_el.get_text(strip=True)[:200] if snippet_el else ""
-
-                    phone = ""
-                    phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', snippet)
-                    if phone_match:
-                        phone = phone_match.group(1)
-
-                    results.append({
-                        "name": name, "address": "", "phone": phone,
-                        "website": website, "snippet": snippet, "source": "Google"
-                    })
-
-            break  # success, exit retry loop
-
-        except Exception as e:
-            if attempt == max_attempts - 1:
-                print(f"  [Google] scrape error: {e}")
-
-    return results
-
-
-# ==============================================================================
-# SOURCE 3: Yelp.ca
-# ==============================================================================
-
-def scrape_yelp(search_term, area, max_results=10):
-    """Scrape Yelp.ca for business listings."""
-    results = []
-    url = f"https://www.yelp.ca/search?find_desc={quote_plus(search_term)}&find_loc={quote_plus(area)}"
-
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        html = r.text
-        print(f"     [Yelp] response: {r.status_code}, {len(html)} chars")
-
-        soup = BeautifulSoup(html, "lxml")
-        listings = soup.select(
-            "div[data-testid='serp-ia-card'], "
-            "li.border-color--default__09f24__BAILS, "
-            "div.container__09f24__FeTO6, "
-            "div[class*='businessName'], "
-            "div.arrange-unit__09f24__rqHTg"
-        )
-
-        if not listings:
-            biz_links = soup.select("a[href*='/biz/']")
-            seen_names = set()
-            for link in biz_links[:max_results * 2]:
-                name = link.get_text(strip=True)
-                name = clean_business_name(name)
-                if not name or len(name) < 3 or name.lower() in seen_names:
-                    continue
-                if is_chain_or_franchise(name):
-                    continue
-                seen_names.add(name.lower())
-
-                parent = link.find_parent("div")
-                address = ""
-                phone = ""
-                if parent:
-                    text = parent.get_text(" ", strip=True)
-                    phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', text)
-                    if phone_match:
-                        phone = phone_match.group(1)
-                    addr_match = re.search(r'(\d+\s+[\w\s]+(?:St|Ave|Rd|Dr|Blvd|Cres|Way|Ct)[\w\s,]*ON)', text, re.I)
-                    if addr_match:
-                        address = addr_match.group(1).strip()
-
-                results.append({
-                    "name": name, "address": address, "phone": phone,
-                    "website": "", "snippet": "", "source": "Yelp"
-                })
-                if len(results) >= max_results:
-                    break
-        else:
             for listing in listings[:max_results]:
                 name_el = listing.select_one(
-                    "a[href*='/biz/'], h3, span[data-testid='serp-ia-card-title']"
+                    "a.listing__name--link, h3.listing__name, "
+                    "a[class*='listing__name'], span.listing__name, h2 a, h3 a"
                 )
                 if not name_el:
                     continue
-                name = clean_business_name(name_el.get_text(strip=True))
-                if not name or len(name) < 3 or is_chain_or_franchise(name):
+                raw_name = name_el.get_text(strip=True)
+                if not raw_name or len(raw_name) < 3:
                     continue
 
-                all_text = listing.get_text(" ", strip=True)
+                name = clean_business_name(raw_name)
+                if not name or is_chain_or_franchise(name):
+                    if name:
+                        print(f"   [YP] Filtered chain: {name}")
+                    continue
 
+                # Address
+                addr_el = listing.select_one(
+                    "span.listing__address--full, span[class*='address'], "
+                    "div.listing__address, span.adr"
+                )
+                address = addr_el.get_text(strip=True) if addr_el else ""
+
+                # Phone
                 phone = ""
-                phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', all_text)
-                if phone_match:
-                    phone = phone_match.group(1)
-
-                address = ""
-                addr_match = re.search(r'(\d+\s+[\w\s]+(?:St|Ave|Rd|Dr|Blvd|Cres|Way|Ct)[\w\s,]*ON)', all_text, re.I)
-                if addr_match:
-                    address = addr_match.group(1).strip()
-
-                results.append({
-                    "name": name, "address": address, "phone": phone,
-                    "website": "", "snippet": "", "source": "Yelp"
-                })
-
-    except Exception as e:
-        print(f"  [Yelp] scrape error: {e}")
-
-    return results
-
-
-# ==============================================================================
-# SOURCE 4: Bing Places
-# ==============================================================================
-
-def scrape_bing_places(search_term, area, max_results=10):
-    """Scrape Bing local search for business listings."""
-    results = []
-    query = f"{search_term} near {area}"
-    url = f"https://www.bing.com/search?q={quote_plus(query)}&setmkt=en-CA"
-
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        html = r.text
-        print(f"     [Bing] response: {r.status_code}, {len(html)} chars")
-
-        soup = BeautifulSoup(html, "lxml")
-        local_items = soup.select(
-            "div.b_scard, div.local-card, li.b_algo, "
-            "div[data-partnertag*='local'], div.b_locald"
-        )
-
-        for item in local_items[:max_results]:
-            name_el = item.select_one("h2 a, h3 a, a.tilk, div.lc_content h2")
-            if not name_el:
-                name_el = item.select_one("a[href]")
-            if not name_el:
-                continue
-
-            name = clean_business_name(name_el.get_text(strip=True))
-            if not name or len(name) < 3 or is_chain_or_franchise(name):
-                continue
-
-            all_text = item.get_text(" ", strip=True)
-
-            phone = ""
-            phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', all_text)
-            if phone_match:
-                phone = phone_match.group(1)
-
-            address = ""
-            addr_match = re.search(
-                r'(\d+\s+[\w\s]+(?:St|Ave|Rd|Dr|Blvd|Cres|Way|Ct|Lane|Pkwy|Hwy)[\w\s.,]*(?:ON|Ontario))',
-                all_text, re.I
-            )
-            if addr_match:
-                address = addr_match.group(1).strip()
-
-            website = ""
-            for a in item.select("a[href^='http']"):
-                href = a.get("href", "")
-                if "bing.com" not in href and "microsoft" not in href:
-                    website = href
-                    break
-
-            results.append({
-                "name": name, "address": address, "phone": phone,
-                "website": website, "snippet": "", "source": "Bing"
-            })
-
-    except Exception as e:
-        print(f"  [Bing] scrape error: {e}")
-
-    return results
-
-
-# ==============================================================================
-# SOURCE 5: BBB (Better Business Bureau) — increased timeout + retry
-# ==============================================================================
-
-def scrape_bbb(search_term, area, max_results=10):
-    """Scrape BBB for accredited business listings. Retries once on timeout."""
-    results = []
-    city = area.split(",")[0].strip()
-    province = area.split(",")[1].strip() if "," in area else "ON"
-    url = (
-        f"https://www.bbb.org/search?find_country=CAN&find_entity=0032-000"
-        f"&find_text={quote_plus(search_term)}"
-        f"&find_loc={quote_plus(city)}&find_state={quote_plus(province)}"
-        f"&page=1&sort=Relevance"
-    )
-
-    max_attempts = 2
-    for attempt in range(max_attempts):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=25)  # increased from 15s
-            r.raise_for_status()
-            html = r.text
-            print(f"     [BBB] response: {r.status_code}, {len(html)} chars")
-
-            soup = BeautifulSoup(html, "lxml")
-            biz_links = soup.select("a[href*='/profile/']")
-            seen = set()
-
-            for link in biz_links[:max_results * 2]:
-                name = link.get_text(strip=True)
-                name = clean_business_name(name)
-                if not name or len(name) < 3 or name.lower() in seen:
-                    continue
-                if is_chain_or_franchise(name):
-                    continue
-                seen.add(name.lower())
-
-                parent = link.find_parent("div")
-                phone = ""
-                address = ""
-                if parent:
-                    text = parent.get_text(" ", strip=True)
-                    phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', text)
+                phone_el = listing.select_one(
+                    "a[class*='phone'], span[class*='phone'], "
+                    "a[data-phone], a[href^='tel:'], "
+                    "span.mlr__sub-text, li.mlr__item--phone, span.listing__phone"
+                )
+                if phone_el:
+                    tel_href = phone_el.get("href", "")
+                    if tel_href.startswith("tel:"):
+                        phone = tel_href.replace("tel:", "").strip()
+                    elif phone_el.get("data-phone"):
+                        phone = phone_el.get("data-phone")
+                    else:
+                        phone = phone_el.get_text(strip=True)
+                if not phone:
+                    for a in listing.select("a[href^='tel:']"):
+                        tel = a.get("href", "").replace("tel:", "").strip()
+                        if len(tel) >= 10:
+                            phone = tel
+                            break
+                if not phone:
+                    all_text = listing.get_text(" ", strip=True)
+                    phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', all_text)
                     if phone_match:
                         phone = phone_match.group(1)
-                    addr_match = re.search(
-                        r'(\d+\s+[\w\s]+(?:St|Ave|Rd|Dr|Blvd|Cres|Way)[\w\s.,]*)',
-                        text, re.I
-                    )
-                    if addr_match:
-                        address = addr_match.group(1).strip()
+                phone = re.sub(r'[^\d+()-.\s]', '', phone).strip()
+
+                # Website
+                website = ""
+                web_el = listing.select_one(
+                    "a[class*='website'], a[data-analytics='website'], a.listing__link--website"
+                )
+                if web_el:
+                    website = web_el.get("href", "")
+                if not website:
+                    for a in listing.select("a[href^='http']"):
+                        href = a.get("href", "")
+                        if "yellowpages.ca" not in href and "ypcdn" not in href:
+                            website = href
+                            break
+
+                # Category / snippet
+                cat_el = listing.select_one("span[class*='category'], div[class*='category']")
+                snippet = cat_el.get_text(strip=True) if cat_el else ""
 
                 results.append({
                     "name": name, "address": address, "phone": phone,
-                    "website": "", "snippet": "BBB Listed", "source": "BBB"
+                    "website": website, "snippet": snippet[:200], "source": "YellowPages"
                 })
-                if len(results) >= max_results:
-                    break
 
-            break  # success
+            break  # success, exit retry loop
 
         except requests.exceptions.Timeout:
             if attempt < max_attempts - 1:
-                print(f"     [BBB] timeout — retrying once...")
-                time.sleep(5)
+                wait = random.uniform(30, 60)
+                print(f"     [YP] timeout -- waiting {wait:.0f}s and retrying...")
+                time.sleep(wait)
                 continue
             else:
-                print(f"  [BBB] timeout after retry — giving up")
+                print(f"  [YP] timeout after retry -- giving up")
         except Exception as e:
-            print(f"  [BBB] scrape error: {e}")
+            if attempt < max_attempts - 1 and "429" in str(e):
+                continue  # already handled above
+            print(f"  [YP] scrape error: {e}")
             break
 
     return results
 
 
 # ==============================================================================
-# SOURCE 6: 411.ca
+# Homepage Fetch + Manual-Work Signal Detection
 # ==============================================================================
 
-def scrape_411ca(search_term, area, max_results=10):
-    """Scrape 411.ca Canadian business directory."""
-    results = []
-    city = area.split(",")[0].strip()
-    url = (
-        f"https://411.ca/search/"
-        f"?q={quote_plus(search_term)}"
-        f"&l={quote_plus(city + ' ON')}"
-        f"&t=business"
-    )
+# Signals for Dental & Medical
+_DENTAL_BOOKING_KEYWORDS = [
+    "book online", "schedule online", "book appointment", "online booking",
+    "book now", "schedule now", "request appointment", "book your appointment",
+    "schedule your", "online scheduling",
+]
+
+_LIVE_CHAT_SCRIPTS = [
+    "intercom", "drift", "tidio", "livechat", "hubspot",
+    "zendesk", "tawk", "crisp", "olark", "freshchat",
+]
+
+_OWNER_DENTIST_PATTERNS = [
+    r"dr\.\s+\w+",            # "Dr. Smith"
+    r"owner[\s-]operator",
+    r"locally\s+owned",
+    r"family\s+practice",
+    r"family[\s-]owned",
+    r"our\s+dentist",
+    r"your\s+dentist",
+    r"meet\s+the\s+doctor",
+    r"meet\s+dr\.",
+]
+
+# Signals for Trades
+_CALL_FOR_QUOTE_KEYWORDS = [
+    "call for quote", "call for estimate", "call for a free",
+    "call today for", "call us for", "call now for",
+    "phone for a quote", "give us a call",
+]
+
+_OWNER_OPERATOR_KEYWORDS = [
+    "family-owned", "family owned", "owner-operated", "owner operated",
+    "locally owned", "locally-owned", "i've been serving",
+    "my team and i", "our family business", "family run",
+    "family-run", "we are a family",
+]
+
+# Slow-response keywords for Places API review snippets
+_SLOW_RESPONSE_KEYWORDS = [
+    "hard to reach", "couldn't get through", "could not get through",
+    "no answer", "called several times", "never answered",
+    "slow to respond", "didn't return my call", "didn't call back",
+    "hard to get a hold", "hard to contact", "unreachable",
+    "left multiple messages", "never got back",
+]
+
+
+def _fetch_homepage(website_url):
+    """
+    Fetch homepage HTML with 7s timeout. Returns (html_text, True) on success,
+    ("", False) on failure.
+    """
+    if not website_url:
+        return "", False
+    # Normalize
+    if not website_url.startswith("http"):
+        website_url = "https://" + website_url
+    try:
+        r = requests.get(website_url, headers=HEADERS, timeout=7, allow_redirects=True)
+        r.raise_for_status()
+        return r.text, True
+    except Exception as e:
+        print(f"     [HP] fetch failed ({website_url[:50]}): {e}")
+        return "", False
+
+
+def _check_places_reviews(business_name):
+    """
+    Check Google Places API review snippets for slow-response signals.
+    Returns (has_slow_response: bool, review_texts: list[str]).
+    Skips silently if API key is not configured.
+    """
+    if not GOOGLE_PLACES_API_KEY:
+        return False, []
 
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        html = r.text
-        print(f"     [411] response: {r.status_code}, {len(html)} chars")
-
-        soup = BeautifulSoup(html, "lxml")
-        listings = soup.select(
-            "div.listing, div.vcard, div.result-card, "
-            "div[class*='listing'], article"
+        # Step 1: Text Search -> place_id
+        search_resp = requests.post(
+            "https://places.googleapis.com/v1/places:searchText",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                "X-Goog-FieldMask": "places.id",
+            },
+            json={"textQuery": f"{business_name} Ontario Canada"},
+            timeout=10,
         )
+        if search_resp.status_code != 200:
+            print(f"     [Places] search failed: {search_resp.status_code}")
+            return False, []
 
-        for listing in listings[:max_results]:
-            name_el = listing.select_one(
-                "h2 a, h3 a, a.listing-name, span.fn, "
-                "a[class*='name'], div.listing-title a"
-            )
-            if not name_el:
-                continue
-            name = clean_business_name(name_el.get_text(strip=True))
-            if not name or len(name) < 3 or is_chain_or_franchise(name):
-                continue
+        places = search_resp.json().get("places", [])
+        if not places:
+            return False, []
+        place_id = places[0].get("id", "")
+        if not place_id:
+            return False, []
 
-            all_text = listing.get_text(" ", strip=True)
+        # Step 2: Place Details with reviews
+        detail_resp = requests.get(
+            f"https://places.googleapis.com/v1/places/{place_id}",
+            headers={
+                "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                "X-Goog-FieldMask": "reviews.text",
+            },
+            timeout=10,
+        )
+        if detail_resp.status_code != 200:
+            return False, []
 
-            phone = ""
-            phone_el = listing.select_one("a[href^='tel:']")
-            if phone_el:
-                phone = phone_el.get("href", "").replace("tel:", "").strip()
-            if not phone:
-                phone_match = re.search(r'(\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4})', all_text)
-                if phone_match:
-                    phone = phone_match.group(1)
+        reviews = detail_resp.json().get("reviews", [])
+        review_texts = []
+        for rev in reviews:
+            text_obj = rev.get("text", {})
+            text = text_obj.get("text", "") if isinstance(text_obj, dict) else str(text_obj)
+            if text:
+                review_texts.append(text)
 
-            address = ""
-            addr_el = listing.select_one("span.adr, div[class*='address'], span.street-address")
-            if addr_el:
-                address = addr_el.get_text(strip=True)
-            if not address:
-                addr_match = re.search(
-                    r'(\d+\s+[\w\s]+(?:St|Ave|Rd|Dr|Blvd|Cres|Way)[\w\s.,]*)',
-                    all_text, re.I
-                )
-                if addr_match:
-                    address = addr_match.group(1).strip()
+        # Check for slow-response keywords
+        all_review_text = " ".join(review_texts).lower()
+        for kw in _SLOW_RESPONSE_KEYWORDS:
+            if kw in all_review_text:
+                return True, review_texts
 
-            website = ""
-            for a in listing.select("a[href^='http']"):
-                href = a.get("href", "")
-                if "411.ca" not in href:
-                    website = href
-                    break
-
-            results.append({
-                "name": name, "address": address, "phone": phone,
-                "website": website, "snippet": "", "source": "411.ca"
-            })
+        return False, review_texts
 
     except Exception as e:
-        print(f"  [411] scrape error: {e}")
+        print(f"     [Places] review check error: {e}")
+        return False, []
 
-    return results
+
+def compute_manual_work_score(vertical, html_text, homepage_fetched, business_name):
+    """
+    Compute a 0-10 manual work score based on homepage signals + Places API reviews.
+
+    Returns (score, priority, signal_string).
+    - priority: 'high' (6+), 'medium' (3-5), or 'skip' (0-2)
+    - signal_string: <100 char human-readable description of top signals
+    """
+    score = 0
+    signals = []  # (points, description)
+
+    html_lower = html_text.lower() if html_text else ""
+
+    if vertical == "Dental & Medical":
+        # -- No online booking link (+3) --
+        has_booking = False
+        for kw in _DENTAL_BOOKING_KEYWORDS:
+            if kw in html_lower:
+                has_booking = True
+                break
+        if not has_booking and homepage_fetched:
+            score += 3
+            signals.append((3, "no online booking system found"))
+
+        # -- Contact form to generic mailer (+2) --
+        if homepage_fetched and html_text:
+            soup = BeautifulSoup(html_text, "lxml")
+            forms = soup.select("form")
+            has_generic_form = False
+            for form in forms:
+                action = (form.get("action") or "").lower()
+                form_text = form.get_text(" ", strip=True).lower()
+                # Generic contact form indicators (not booking)
+                if ("contact" in form_text or "message" in form_text or
+                    "mailto:" in action or "formspree" in action or
+                    "getform" in action or "netlify" in action):
+                    if not any(bk in form_text for bk in ["book", "schedule", "appointment"]):
+                        has_generic_form = True
+                        break
+            if has_generic_form:
+                score += 2
+                signals.append((2, "contact form without booking integration"))
+
+        # -- No live chat widget (+1) --
+        has_chat = False
+        for script_kw in _LIVE_CHAT_SCRIPTS:
+            if script_kw in html_lower:
+                has_chat = True
+                break
+        if not has_chat and homepage_fetched:
+            score += 1
+            signals.append((1, "no live chat widget"))
+
+        # -- Outdated site design (+1) --
+        if homepage_fetched and html_text:
+            has_viewport = 'name="viewport"' in html_lower or "name='viewport'" in html_lower
+            has_doctype = html_lower.strip().startswith("<!doctype html")
+            # Check for excessive inline styles
+            inline_count = html_lower.count('style="')
+            is_outdated = (not has_viewport) or (not has_doctype) or (inline_count > 20)
+            if is_outdated:
+                score += 1
+                signals.append((1, "outdated site design"))
+
+        # -- Single location (+1) --
+        if homepage_fetched and html_text:
+            # Count distinct street address patterns
+            addr_matches = re.findall(
+                r'\d+\s+[\w\s]+(?:st|ave|rd|dr|blvd|cres|way|ct|lane|pkwy|hwy)',
+                html_lower
+            )
+            unique_addrs = set()
+            for a in addr_matches:
+                # Normalize for comparison
+                norm = re.sub(r'\s+', ' ', a.strip())
+                unique_addrs.add(norm)
+            if len(unique_addrs) <= 1:
+                score += 1
+                signals.append((1, "single location"))
+
+        # -- Owner-dentist language (+2) --
+        for pattern in _OWNER_DENTIST_PATTERNS:
+            if re.search(pattern, html_lower, re.I):
+                score += 2
+                signals.append((2, "owner-dentist language on site"))
+                break
+
+    elif vertical == "Trades":
+        # -- "Call for quote" language (+3) --
+        has_call_cta = False
+        for kw in _CALL_FOR_QUOTE_KEYWORDS:
+            if kw in html_lower:
+                has_call_cta = True
+                break
+        # Also check if primary CTA is just a phone number (no form)
+        if not has_call_cta and homepage_fetched and html_text:
+            soup = BeautifulSoup(html_text, "lxml")
+            # Check for prominent tel: links without any quote forms
+            tel_links = soup.select("a[href^='tel:']")
+            quote_forms = soup.select("form")
+            has_quote_form = False
+            for f in quote_forms:
+                ft = f.get_text(" ", strip=True).lower()
+                if any(w in ft for w in ["quote", "estimate", "book", "schedule"]):
+                    has_quote_form = True
+                    break
+            if tel_links and not has_quote_form:
+                has_call_cta = True
+        if has_call_cta:
+            score += 3
+            signals.append((3, "call for quote with no online form"))
+
+        # -- No online quote/booking form (+2) --
+        if homepage_fetched and html_text:
+            soup = BeautifulSoup(html_text, "lxml")
+            forms = soup.select("form")
+            has_quote_form = False
+            for f in forms:
+                ft = f.get_text(" ", strip=True).lower()
+                if any(w in ft for w in ["quote", "estimate", "book", "schedule", "request"]):
+                    has_quote_form = True
+                    break
+            if not has_quote_form:
+                score += 2
+                signals.append((2, "no online quote or booking form"))
+
+        # -- No SMS/auto-response mention (+1) --
+        has_sms = any(kw in html_lower for kw in [
+            "text us", "we'll text back", "auto-reply", "auto reply",
+            "sms", "text message",
+        ])
+        if not has_sms and homepage_fetched:
+            score += 1
+            signals.append((1, "no SMS or auto-response"))
+
+        # -- Owner-operator language (+2) --
+        for kw in _OWNER_OPERATOR_KEYWORDS:
+            if kw in html_lower:
+                score += 2
+                signals.append((2, "owner-operator language on site"))
+                break
+
+        # -- Single location (+1) --
+        if homepage_fetched and html_text:
+            addr_matches = re.findall(
+                r'\d+\s+[\w\s]+(?:st|ave|rd|dr|blvd|cres|way|ct|lane|pkwy|hwy)',
+                html_lower
+            )
+            unique_addrs = set()
+            for a in addr_matches:
+                norm = re.sub(r'\s+', ' ', a.strip())
+                unique_addrs.add(norm)
+            if len(unique_addrs) <= 1:
+                score += 1
+                signals.append((1, "single location"))
+
+    # -- Reviews mention slow response (+1) -- applies to both verticals
+    has_slow_response, _ = _check_places_reviews(business_name)
+    if has_slow_response:
+        score += 1
+        signals.append((1, "reviews mention slow response"))
+
+    # Cap at 10
+    score = min(score, 10)
+
+    # Priority mapping
+    if score >= 6:
+        priority = "high"
+    elif score >= 3:
+        priority = "medium"
+    else:
+        priority = "skip"
+
+    # Build signal string from top signals (highest points first), max 100 chars
+    signals.sort(key=lambda x: x[0], reverse=True)
+    if not signals:
+        signal_str = "no signals detected"
+    else:
+        # Take signals starting from highest, join with comma until < 100 chars
+        parts = []
+        total_len = 0
+        for _, desc in signals:
+            if total_len + len(desc) + 2 > 100:
+                break
+            parts.append(desc)
+            total_len += len(desc) + 2
+        signal_str = ", ".join(parts) if parts else signals[0][1][:100]
+
+    # Default score for homepage fetch failures
+    if not homepage_fetched and score == 0:
+        score = 3
+        priority = "medium"
+        signal_str = "homepage unreachable, default score assigned"
+
+    return score, priority, signal_str
 
 
 # -- Prospect Builder ---------------------------------------------------------
 
-AI_GAPS_BY_VERTICAL = {
-    "Restaurants": "AI booking, review response, menu optimization, inventory forecasting",
-    "Retail": "AI inventory mgmt, customer chatbot, personalized marketing, POS analytics",
-    "Trades": "AI scheduling & dispatch, automated quoting, review mgmt, lead follow-up",
-    "Dental & Medical": "AI appointment booking, patient reminders, intake forms, review mgmt",
-    "Salons & Spas": "AI online booking, no-show prediction, client retention, social media",
-    "Professional Services": "AI client intake, document automation, scheduling, follow-up emails",
-    "Fitness & Wellness": "AI class scheduling, member retention, billing automation, lead nurture",
-    "Auto Services": "AI appointment booking, parts inventory, customer follow-up, estimates",
-    "Cleaning & Property": "AI scheduling & routing, quoting, customer portal, invoice automation",
-}
+def build_prospect(raw, vertical, area, score, priority, signal):
+    """
+    Convert raw scraped data into a CRM prospect record matching Supabase schema.
 
-def _ai_gap_for_vertical(vertical, area):
-    """Generate a specific AI gap description based on the vertical."""
-    gaps = AI_GAPS_BY_VERTICAL.get(vertical, "AI automation opportunity")
-    city = area.split(",")[0]
-    return f"AI automation opportunity — {vertical.lower()} in {city}. Gaps: {gaps}"
-
-def build_prospect(raw, vertical, area):
-    """Convert raw scraped data into a CRM prospect record matching Supabase schema."""
+    v3 changes:
+    - Writes priority, manual_work_score, manual_work_signal columns
+    - Writes to website (not website_url)
+    - Does NOT write to opp (no AI gap descriptions at source time)
+    - Uses business_name.rstrip('.') to prevent double periods for Inc. businesses
+    """
     source = raw.get("source", "Unknown")
     city = area.split(",")[0].strip()
-    slug = slugify(f"{raw['name']}-{city}")
+    biz_name = raw["name"].rstrip(".")
+    slug = slugify(f"{biz_name}-{city}")
 
     now = datetime.now(timezone.utc).isoformat()
     return {
         "id": slug,
-        "name": raw["name"][:100],
+        "name": biz_name[:100],
         "cat": vertical,
         "status": "NOT CONTACTED",
         "address": raw.get("address", "")[:200] or area,
@@ -995,134 +932,89 @@ def build_prospect(raw, vertical, area):
         "email": raw.get("email", ""),
         "website": raw.get("website", ""),
         "owner": raw.get("owner", ""),
-        "opp": _ai_gap_for_vertical(vertical, area),
         "action": "Research & qualify",
-        "notes": f"[Auto-sourced {datetime.now().strftime('%Y-%m-%d')} via {source}] {raw.get('snippet', '')[:120]}",
+        "priority": priority,
+        "manual_work_score": score,
+        "manual_work_signal": signal[:100],
+        "notes": f"[Auto-sourced {datetime.now().strftime('%Y-%m-%d')} via {source}] score={score} {signal[:80]}",
         "last_contact": None,
-        "date": None,
-        "activities": json.dumps([]),
         "created_at": now,
-        "updated_at": now,
     }
-
-
-# -- Multi-Source Scraper Dispatcher ------------------------------------------
-
-def scrape_all_sources(search_term, area, max_results=5, circuit_breaker=None):
-    """
-    Run all 6 scrapers for a given search term + area.
-    Returns a combined, name-deduplicated list.
-    Uses circuit breaker to skip failing sources.
-    """
-    all_results = []
-    seen_names = {}
-
-    sources = [
-        ("YellowPages", lambda: scrape_yellowpages(search_term, area, max_results)),
-        ("Google",       lambda: scrape_google_maps(search_term, area, max_results)),
-        ("Yelp",         lambda: scrape_yelp(search_term, area, max_results)),
-        ("Bing",         lambda: scrape_bing_places(search_term, area, max_results)),
-        ("BBB",          lambda: scrape_bbb(search_term, area, max_results)),
-        ("411.ca",       lambda: scrape_411ca(search_term, area, max_results)),
-    ]
-
-    for source_name, scrape_fn in sources:
-        # Circuit breaker check
-        if circuit_breaker and circuit_breaker.is_disabled(source_name):
-            print(f"   [{source_name}] SKIPPED (circuit breaker)")
-            continue
-
-        try:
-            results = scrape_fn()
-            print(f"   [{source_name}] returned {len(results)} results")
-
-            if circuit_breaker:
-                if len(results) > 0:
-                    circuit_breaker.record_success(source_name, len(results))
-                else:
-                    circuit_breaker.record_failure(source_name, "0 results")
-
-            for item in results:
-                norm = item["name"].strip().lower()
-                if norm in seen_names:
-                    idx = seen_names[norm]
-                    existing = all_results[idx]
-                    if not existing.get("phone") and item.get("phone"):
-                        existing["phone"] = item["phone"]
-                    if not existing.get("address") and item.get("address"):
-                        existing["address"] = item["address"]
-                    if not existing.get("website") and item.get("website"):
-                        existing["website"] = item["website"]
-                    if not existing.get("email") and item.get("email"):
-                        existing["email"] = item["email"]
-                    existing["source"] = existing.get("source", "") + f"+{source_name}"
-                else:
-                    seen_names[norm] = len(all_results)
-                    all_results.append(item)
-
-        except Exception as e:
-            print(f"   [{source_name}] failed: {e}")
-            if circuit_breaker:
-                circuit_breaker.record_failure(source_name, str(e)[:50])
-
-        # Delay between sources
-        time.sleep(random.uniform(1.0, 2.5))
-
-    return all_results
 
 
 # -- Main Agent Logic ---------------------------------------------------------
 
 def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
     """
-    Main entry point. Searches 6 sources for leads, deduplicates,
-    enriches from websites, writes to Supabase, and notifies Franco.
+    Main entry point. Searches YellowPages for leads, scores them,
+    writes qualified leads to Supabase, and notifies Franco.
+
+    v3 flow:
+    1. Fetch existing prospect IDs from Supabase for dedup
+    2. For each active vertical (dental, trades):
+         For each YP search term:
+           For each area (sampled):
+             a. Scrape YellowPages
+             b. For each result:
+                - Dedup check (slug ID)
+                - Chain/size filter
+                - Fetch homepage (7s timeout, 3-5s delay)
+                - Places API review check (inside compute_manual_work_score)
+                - Compute manual-work score
+                - If score < 3: skip
+                - Build prospect record
+                - Append to batch
+    3. Insert all leads to Supabase
+    4. SMS summary
     """
-    verticals = verticals or list(VERTICALS.keys())
-    # areas param is only used if --area is explicitly passed
+    verticals = verticals or list(ACTIVE_VERTICALS)
     use_smart_areas = areas is None
     areas = areas or GTA_AREAS_FULL
 
-    circuit_breaker = SourceCircuitBreaker()
+    circuit_breaker = YPCircuitBreaker()
 
     print("=" * 60)
-    print("  Unify Lead Sourcer Agent v2.1 (Multi-Source + Circuit Breaker)")
+    print("  Unify Lead Sourcer Agent v3.0 (YP-only + Manual-Work Scoring)")
     print("=" * 60)
     print(f"  Verticals : {', '.join(verticals)}")
     print(f"  Areas     : {'smart per-vertical' if use_smart_areas else f'{len(areas)} locations'}")
     print(f"  Max/search: {max_per_search}")
-    print(f"  Sources   : YellowPages, Google, Yelp, Bing, BBB, 411.ca")
+    print(f"  Source    : YellowPages.ca only")
+    print(f"  Scoring   : manual-work 0-10, skip < 3")
     print(f"  Dry run   : {dry_run}")
-    print(f"  Filter    : Chains BLOCKED, no-name SKIPPED")
+    print(f"  Filter    : Chains BLOCKED, owner name NOT required")
     print(f"  Supabase  : {'Connected' if SUPABASE_KEY else 'No key'}")
     print(f"  Twilio    : {'Configured' if TWILIO_SID else 'Skipped'}")
+    print(f"  Places API: {'Configured' if GOOGLE_PLACES_API_KEY else 'Skipped (no review check)'}")
     print()
 
-    # Step 1: Get existing prospects for deduplication
-    existing = set()
+    # Step 1: Get existing prospect IDs for deduplication
+    existing_ids = set()
     if not dry_run and SUPABASE_KEY:
-        print("Fetching existing prospects for dedup...")
-        existing = sb_get_existing_names()
-        print(f"   Found {len(existing)} existing prospects\n")
+        print("Fetching existing prospect IDs for dedup...")
+        existing_ids = sb_get_existing_ids()
+        print(f"   Found {len(existing_ids)} existing prospects\n")
 
-    # Step 2: Multi-source scraping
+    # Step 2: YP-only scraping with manual-work scoring
     all_leads = []
     searches_done = 0
-    skipped_no_name = 0
+    skipped_low_score = 0
     skipped_duplicate = 0
     skipped_chain = 0
     skipped_too_large = 0
     skipped_too_small = 0
-    saved_no_name = 0
-
-    # Shuffle verticals so each daily run covers different industries
-    verticals = list(verticals)
-    random.shuffle(verticals)
+    skipped_no_contact = 0
+    n_high = 0
+    n_medium = 0
+    signal_counts = {}  # track most common signals
 
     for v_name in verticals:
-        # Smart area selection
+        if v_name not in VERTICALS:
+            print(f"  Warning: vertical '{v_name}' not recognized, skipping")
+            continue
+
         if use_smart_areas:
-            v_areas = VERTICAL_AREA_MAP.get(v_name, GTA_AREAS_CORE)
+            v_areas = VERTICAL_AREA_MAP.get(v_name, GTA_AREAS_FULL)
         else:
             v_areas = areas
 
@@ -1138,58 +1030,97 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
             chosen_areas = random.sample(v_areas, min(5, len(v_areas)))
 
             for area in chosen_areas:
+                # Circuit breaker abort check
+                if circuit_breaker.should_abort:
+                    print("\n   [ABORT] YellowPages failing -- stopping run")
+                    break
+
                 print(f"\n{'='*50}")
                 print(f"SEARCH: {search_term} in {area}")
                 print(f"{'='*50}")
 
-                raw_results = scrape_all_sources(
-                    search_term, area, max_results=max_per_search,
-                    circuit_breaker=circuit_breaker
+                raw_results = scrape_yellowpages(
+                    search_term, area, max_results=max_per_search
                 )
-                print(f"\n   Combined: {len(raw_results)} unique businesses from all sources")
+                print(f"\n   YP returned {len(raw_results)} results")
+
+                if len(raw_results) > 0:
+                    circuit_breaker.record_success(len(raw_results))
+                else:
+                    circuit_breaker.record_failure("0 results")
 
                 for raw in raw_results:
-                    norm_name = raw["name"].strip().lower()
-                    if norm_name in existing:
-                        print(f"   SKIP duplicate: {raw['name']}")
+                    biz_name = raw["name"].rstrip(".")
+                    city = area.split(",")[0].strip()
+                    slug = slugify(f"{biz_name}-{city}")
+
+                    # Dedup by slug ID
+                    if slug in existing_ids:
+                        print(f"   SKIP duplicate: {biz_name} ({slug})")
                         skipped_duplicate += 1
                         continue
 
-                    # TARGET MARKET FILTER: skip too-large businesses (3+ locations, corporate)
-                    raw_addr = raw.get("address", "")
-                    raw_notes = raw.get("notes", "")
-                    if is_too_large(raw["name"], raw_addr, raw_notes):
-                        print(f"   SKIP (too large/corporate): {raw['name']}")
-                        skipped_too_large += 1
+                    # Chain filter
+                    if is_chain_or_franchise(biz_name):
+                        print(f"   SKIP chain: {biz_name}")
+                        skipped_chain += 1
                         continue
 
-                    # TARGET MARKET FILTER: skip too-small businesses (solo, home-based)
-                    if is_too_small(raw["name"], raw_addr, raw_notes):
-                        print(f"   SKIP (too small/home-based): {raw['name']}")
+                    # Target market filters
+                    raw_addr = raw.get("address", "")
+                    if is_too_large(biz_name, raw_addr):
+                        print(f"   SKIP (too large): {biz_name}")
+                        skipped_too_large += 1
+                        continue
+                    if is_too_small(biz_name, raw_addr):
+                        print(f"   SKIP (too small): {biz_name}")
                         skipped_too_small += 1
                         continue
 
-                    # Enrichment (owner/email/phone) now handled by enrichment_agent.py
-                    # FILTER: Owner name required UNLESS lead has email OR phone
-                    has_owner = bool(raw.get("owner", "").strip())
+                    # v3: no owner-name hard filter, but need phone OR email
                     has_email = bool(raw.get("email", "").strip())
                     has_phone = bool(raw.get("phone", "").strip())
-
-                    if not has_owner and not (has_email or has_phone):
-                        print(f"   SKIP (no name, no email, no phone): {raw['name']}")
-                        skipped_no_name += 1
+                    has_website = bool(raw.get("website", "").strip())
+                    if not (has_email or has_phone or has_website):
+                        print(f"   SKIP (no contact info at all): {biz_name}")
+                        skipped_no_contact += 1
                         continue
 
-                    prospect = build_prospect(raw, v_name, area)
+                    # Fetch homepage for scoring
+                    print(f"   Scoring: {biz_name}...")
+                    hp_html, hp_ok = _fetch_homepage(raw.get("website", ""))
 
-                    # Flag no-name leads for enrichment by cold email agent
-                    if not has_owner:
-                        prospect["action"] = "Needs enrichment (no owner name)"
-                        saved_no_name += 1
-                        print(f"   SAVED (no name, has contact info): {raw['name']}")
+                    # 3-5 second delay between homepage fetches
+                    time.sleep(random.uniform(3.0, 5.0))
 
+                    # Compute manual-work score
+                    score, priority, signal = compute_manual_work_score(
+                        v_name, hp_html, hp_ok, biz_name
+                    )
+                    print(f"     Score: {score}/10 -> {priority} | {signal}")
+
+                    # Skip low-score prospects
+                    if priority == "skip":
+                        print(f"   SKIP (score {score} < 3): {biz_name}")
+                        skipped_low_score += 1
+                        continue
+
+                    # Build and collect prospect
+                    prospect = build_prospect(raw, v_name, area, score, priority, signal)
                     all_leads.append(prospect)
-                    existing.add(norm_name)
+                    existing_ids.add(slug)
+
+                    # Track priorities
+                    if priority == "high":
+                        n_high += 1
+                    else:
+                        n_medium += 1
+
+                    # Track signal frequencies
+                    for part in signal.split(", "):
+                        part = part.strip()
+                        if part:
+                            signal_counts[part] = signal_counts.get(part, 0) + 1
 
                     # Daily cap: stop sourcing once we hit 20 leads
                     if len(all_leads) >= 20:
@@ -1198,51 +1129,41 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
 
                 searches_done += 1
 
-                # Break out of area loop if cap reached
-                if len(all_leads) >= 20:
+                if len(all_leads) >= 20 or circuit_breaker.should_abort:
                     break
 
-                # Rate limit between search combos (increased from 2-4s)
+                # Rate limit between search combos
                 delay = random.uniform(3.0, 6.0)
                 print(f"   Waiting {delay:.1f}s...\n")
                 time.sleep(delay)
 
-                # Extra delay for Google to reduce 429s
-                if not circuit_breaker.is_disabled("Google"):
-                    google_delay = random.uniform(3.0, 5.0)
-                    time.sleep(google_delay)
-
-            # Break out of search term loop if cap reached
-            if len(all_leads) >= 20:
+            if len(all_leads) >= 20 or circuit_breaker.should_abort:
                 break
 
-        # Break out of vertical loop if cap reached
-        if len(all_leads) >= 20:
+        if len(all_leads) >= 20 or circuit_breaker.should_abort:
             break
 
     # Step 3: Summary
     print("\n" + "=" * 60)
-    print(f"  Unify Lead Sourcer — Run Complete")
+    print(f"  Unify Lead Sourcer v3.0 -- Run Complete")
     print(f"  {'='*56}")
     print(f"     Searches run       : {searches_done}")
     print(f"     Total leads found  : {len(all_leads)}")
-    print(f"     With owner name    : {len(all_leads) - saved_no_name}")
-    print(f"     No name (email+ph) : {saved_no_name}")
-    print(f"     Skipped (no name)  : {skipped_no_name}")
+    print(f"     High priority      : {n_high}")
+    print(f"     Medium priority    : {n_medium}")
+    print(f"     Skipped (low score): {skipped_low_score}")
+    print(f"     Skipped (duplicate): {skipped_duplicate}")
+    print(f"     Skipped (chain)    : {skipped_chain}")
     print(f"     Skipped (too large): {skipped_too_large}")
     print(f"     Skipped (too small): {skipped_too_small}")
-    print(f"     Skipped (duplicate): {skipped_duplicate}")
+    print(f"     Skipped (no info)  : {skipped_no_contact}")
     print(f"     Source performance : {circuit_breaker.summary()}")
     print("=" * 60)
 
-    # Per-vertical breakdown
-    cats = {}
-    for p in all_leads:
-        cats[p["cat"]] = cats.get(p["cat"], 0) + 1
-    if cats:
-        breakdown = ", ".join(f"{v} {k}" for k, v in cats.items())
-    else:
-        breakdown = "none"
+    # Most common signal
+    top_signal = ""
+    if signal_counts:
+        top_signal = max(signal_counts, key=signal_counts.get)
 
     # Print preview
     if all_leads:
@@ -1251,7 +1172,9 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
             email_flag = "E" if p["email"] else " "
             phone_flag = "P" if p["phone"] else " "
             owner_flag = "O" if p["owner"] else " "
-            print(f"   {i:>2}. [{email_flag}{phone_flag}{owner_flag}] {p['name'][:35]:<35} | {p['cat']:<22} | {p['owner'][:20]}")
+            pri = "H" if p["priority"] == "high" else "M"
+            score_val = p.get("manual_work_score", 0)
+            print(f"   {i:>2}. [{pri}{score_val:>2}] [{email_flag}{phone_flag}{owner_flag}] {p['name'][:35]:<35} | {p['cat']:<18}")
         if len(all_leads) > 15:
             print(f"   ... and {len(all_leads) - 15} more")
 
@@ -1279,29 +1202,29 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
         print(f"\n  Total inserted: {inserted}/{len(all_leads)}")
 
     # Step 5: ALWAYS notify Franco via SMS (even if 0 new leads)
-    named = inserted - saved_no_name if inserted > saved_no_name else 0
-    if inserted > 0:
+    if circuit_breaker.should_abort:
+        msg = "Unify sourcer: YellowPages failing, manual check needed."
+    elif inserted > 0 or (dry_run and all_leads):
+        n = inserted if not dry_run else len(all_leads)
+        h = n_high
+        m = n_medium
+        sig_part = f"Top signal: {top_signal}." if top_signal else ""
         msg = (
-            f"Unify: {inserted} new leads added! "
-            f"{named} with owner name, {saved_no_name} need name enrichment. "
-            f"({breakdown}). "
-            f"Skipped: {skipped_no_name} no-info, {skipped_duplicate} dupes, "
-            f"{skipped_too_large} too-large, {skipped_too_small} too-small. "
-            f"Review: unify-crm-coral.vercel.app"
-        )
+            f"Unify sourcer: {n} leads, {h} high / {m} medium priority. "
+            f"{sig_part} "
+            f"Review at https://unify-crm-coral.vercel.app/"
+        ).strip()
     elif all_leads and not dry_run:
         msg = (
-            f"Unify: {len(all_leads)} leads found but insert failed. "
+            f"Unify sourcer: {len(all_leads)} leads found but insert failed. "
             f"Check GitHub Actions logs."
         )
     elif dry_run:
         msg = None  # Don't SMS on dry run
     else:
         msg = (
-            f"Unify: Lead sourcer ran - 0 new leads. "
-            f"Skipped: {skipped_no_name} no-info, {skipped_duplicate} dupes, "
-            f"{skipped_too_large} too-large, {skipped_too_small} too-small. "
-            f"Next run may yield different results."
+            f"Unify sourcer: 0 leads, check logs. "
+            f"Review at https://unify-crm-coral.vercel.app/"
         )
 
     if msg:
@@ -1314,14 +1237,20 @@ def run_agent(verticals=None, areas=None, max_per_search=5, dry_run=False):
 # -- CLI ----------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Unify Lead Sourcer Agent v2.1")
+    all_vertical_names = [
+        "Dental & Medical", "Trades",
+        "Restaurants", "Retail", "Salons & Spas",
+        "Professional Services", "Fitness & Wellness",
+        "Auto Services", "Cleaning & Property",
+    ]
+    parser = argparse.ArgumentParser(description="Unify Lead Sourcer Agent v3.0")
     parser.add_argument("--vertical", "-v", nargs="+",
-                        choices=list(VERTICALS.keys()),
-                        help="Which verticals to search (default: all)")
+                        choices=all_vertical_names,
+                        help="Which verticals to search (default: Dental & Medical, Trades)")
     parser.add_argument("--area", "-a", nargs="+",
-                        help="Specific areas to search (default: smart per-vertical)")
+                        help="Specific areas to search (default: all 55 GTA areas)")
     parser.add_argument("--max", "-m", type=int, default=5,
-                        help="Max results per search query (default: 5)")
+                        help="Max results per YP search query (default: 5)")
     parser.add_argument("--dry-run", "-d", action="store_true",
                         help="Preview results without writing to DB or sending SMS")
     args = parser.parse_args()

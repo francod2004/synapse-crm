@@ -2,12 +2,13 @@ name: Unify Lead Sourcer
 
 on:
   schedule:
-    - cron: '17 14 * * *'  # 10:17 AM EDT daily (off-peak minute to avoid cron skips)
+    - cron: '0 14 * * *'  # 10:00 AM EDT daily
   workflow_dispatch:        # Manual trigger from Actions tab
 
 jobs:
   source-leads:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -26,4 +27,5 @@ jobs:
           TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
           TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
           FRANCO_PHONE: ${{ secrets.FRANCO_PHONE }}
+          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
         run: python lead_sourcer.py --max 10
