@@ -159,11 +159,20 @@ _VERTICAL_HOOKS = {
 
 
 # Fallback observation (sentence 3) when manual_work_signal is missing.
-# Only dental + trades are active; the paused verticals raise before we get
-# here, but the dict is keyed defensively.
+# Phrased as an assertion, not a hedge. Any prospect that scored 3+ on the
+# sourcer's manual-work checklist has the pattern -- we're just stating it
+# without naming the specific tripwire that flagged the score. "I poked
+# around" / "looks like it still" reads too casual and hedgy for cold
+# professional outreach; "Took a look at your site --" is diagnostic.
 _OBSERVATION_FALLBACK = {
-    "Dental & Medical": "your current intake flow",
-    "Trades":           "your current quote process",
+    "Dental & Medical": (
+        "Took a look at your site -- your intake still runs through the "
+        "front desk for booking and confirmations."
+    ),
+    "Trades": (
+        "Took a look at your site -- your quote process still runs through "
+        "phone and email rather than a structured intake form."
+    ),
 }
 
 
@@ -473,9 +482,36 @@ def send_email_via_resend(to_email, to_name, subject, body_html, body_text):
 # =============================================================================
 
 def _clean_business_name(name: str) -> str:
-    """Strip trailing period on 'Inc.' / 'Ltd.' so template sentences don't
-    produce double periods."""
-    return (name or "").rstrip().rstrip(".")
+    """Strip the trailing period only on the three abbreviations where a
+    template-closing '.' would produce a double period ("Inc..", "Corp..",
+    "LLC.."). 'Co.', 'Ltd.', 'Co-op', etc. are preserved as integral to the
+    name itself -- stripping them reads as if the name is incomplete.
+
+    Recurring theme (see memory.md Lessons 2026-04-14): abbreviation
+    handling and encoding edge cases bite this codebase repeatedly.
+    Default-test any templating change against the fixtures below before
+    shipping."""
+    n = (name or "").rstrip()
+    for suffix in (" Inc.", " Corp.", " LLC."):
+        if n.endswith(suffix):
+            return n[:-1]
+    return n
+
+
+def _to_em_dash(s: str) -> str:
+    """Convert double-hyphen to Unicode em-dash in rendered email bodies.
+
+    Source templates and print statements keep '--' for Windows cp1252
+    safety (see memory.md: Unicode arrows and em-dashes in PowerShell /
+    stdout trigger encoding errors on Windows). Email bodies ride Gmail
+    and Resend as UTF-8 so real em-dash renders clean and reads more
+    polished than '--' which looks like draft notation.
+
+    Handles two cases: mid-sentence ' -- ' (spaces both sides) and the
+    line-starting sign-off '-- Franco'. Any '--' inside a signal or
+    other user-supplied text with spaces also gets converted, which is
+    the desired behaviour."""
+    return s.replace(" -- ", " \u2014 ").replace("-- Franco", "\u2014 Franco")
 
 
 def _extract_first_name(owner: str) -> str:
@@ -542,9 +578,11 @@ def _generate_hook(prospect: dict):
 def _build_observation(prospect: dict) -> str:
     """Sentence 3 -- names a concrete manual-work friction.
 
-    Uses manual_work_signal verbatim when present. When empty, falls back to
-    a vertical-generic phrasing (dental: 'your current intake flow', trades:
-    'your current quote process').
+    Uses manual_work_signal verbatim when present. When empty, falls back
+    to a vertical-specific assertion pulled from _OBSERVATION_FALLBACK.
+    The fallback is phrased as diagnostic, not hedging -- the prospect
+    already scored 3+ on the sourcer's manual-work checklist, so the
+    pattern is there; we just don't know which specific tripwire fired.
     """
     signal = (prospect.get("manual_work_signal") or "").strip().rstrip(".")
     if signal:
@@ -553,10 +591,10 @@ def _build_observation(prospect: dict) -> str:
     vertical = prospect.get("cat", "")
     fallback = _OBSERVATION_FALLBACK.get(vertical)
     if fallback:
-        return (f"I poked around your site and {fallback} looks like it "
-                f"still routes through a manual step.")
-    # This path shouldn't be reached because paused verticals already raised.
-    return "I poked around your site and saw a few places a manual step could be tightened up."
+        return fallback
+    # Defensive default -- paused verticals should have raised upstream.
+    return ("Took a look at your site and noticed a few spots where a "
+            "manual step adds time across the week.")
 
 
 def _build_email_body(prospect: dict, tier: int, hook: str):
@@ -573,20 +611,32 @@ def _build_email_body(prospect: dict, tier: int, hook: str):
     owner = (prospect.get("owner_name") or prospect.get("owner") or "").strip()
 
     first_name = _extract_first_name(owner)
-    if first_name:
-        # Dental/medical: prefer 'Dr. Smith' if credentials suggest it
-        creds = (prospect.get("credentials") or "").upper()
-        if "DDS" in creds or "DMD" in creds or "MD" in creds:
-            # Use last name with Dr. prefix if available
-            parts = owner.split()
-            if len(parts) >= 2:
-                greeting = f"Hi Dr. {parts[-1]},"
-            else:
-                greeting = f"Hi {first_name},"
-        else:
-            greeting = f"Hi {first_name},"
+
+    # Last name -- drop any leading honorific, then take the final token.
+    last_name = ""
+    if owner:
+        parts = owner.split()
+        while parts and parts[0].rstrip(".").lower() in {"dr", "mr", "ms", "mrs", "miss"}:
+            parts = parts[1:]
+        if len(parts) >= 2:
+            last_name = parts[-1].rstrip(",.")
+
+    # Credentialed professional rule: if credentials field contains DDS,
+    # DMD, MD, DO, or DC (word-boundary match), use "Hi Dr. {last_name},".
+    # Fall back to "Hi there," rather than hang a title on a first-name-only
+    # record -- "Hi Dr.," with no last name reads broken.
+    creds = (prospect.get("credentials") or "").upper()
+    is_credentialed = bool(re.search(r"\b(DDS|DMD|MD|DO|DC)\b", creds))
+
+    if is_credentialed and last_name:
+        greeting = f"Hi Dr. {last_name},"
+        to_name = f"Dr. {last_name}"
+    elif first_name and not is_credentialed:
+        greeting = f"Hi {first_name},"
+        to_name = first_name
     else:
         greeting = "Hi there,"
+        to_name = prospect.get("name", "") or ""
 
     observation = _build_observation(prospect)
 
@@ -597,8 +647,9 @@ def _build_email_body(prospect: dict, tier: int, hook: str):
 
     signoff = "-- Franco"
 
-    # Plain text version
-    text = (
+    # Plain text version -- em-dash conversion applied at the end so the
+    # source lines stay ASCII-safe for Windows cp1252 stdout.
+    text = _to_em_dash(
         f"{greeting}\n\n"
         f"{hook}\n\n"
         f"{observation}\n\n"
@@ -607,7 +658,7 @@ def _build_email_body(prospect: dict, tier: int, hook: str):
     )
 
     # HTML version (plain paragraphs, no signature block)
-    html = (
+    html = _to_em_dash(
         f"<p>{greeting}</p>\n"
         f"<p>{hook}</p>\n"
         f"<p>{observation}</p>\n"
@@ -616,7 +667,7 @@ def _build_email_body(prospect: dict, tier: int, hook: str):
     )
 
     subject = f"Quick question about {business_name}"
-    return subject, text, html
+    return subject, text, html, to_name
 
 
 def generate_email(prospect: dict):
@@ -637,10 +688,7 @@ def generate_email(prospect: dict):
         print(f"    SKIP (unknown vertical): {e}")
         return None
 
-    subject, text, html = _build_email_body(prospect, tier, hook)
-
-    owner = (prospect.get("owner_name") or prospect.get("owner") or "").strip()
-    to_name = _extract_first_name(owner) or prospect.get("name", "")
+    subject, text, html, to_name = _build_email_body(prospect, tier, hook)
 
     return {
         "to_email": email,
@@ -684,8 +732,8 @@ def _build_day4_email(prospect: dict):
     body = "Did my last note get buried? Happy to send that Loom over whenever works."
     signoff = "-- Franco"
 
-    text = f"{greeting}\n\n{body}\n\n{signoff}\n"
-    html = f"<p>{greeting}</p>\n<p>{body}</p>\n<p>{signoff}</p>\n"
+    text = _to_em_dash(f"{greeting}\n\n{body}\n\n{signoff}\n")
+    html = _to_em_dash(f"<p>{greeting}</p>\n<p>{body}</p>\n<p>{signoff}</p>\n")
 
     return {
         "to_email": prospect.get("email"),
@@ -926,8 +974,8 @@ def _build_loom_recorded_followup(prospect: dict, loom_link: str):
                "happy to jump on a quick call.")
     signoff = "-- Franco"
 
-    text = f"{greeting}\n\n{body}\n\n{callout}\n\n{signoff}\n"
-    html = (
+    text = _to_em_dash(f"{greeting}\n\n{body}\n\n{callout}\n\n{signoff}\n")
+    html = _to_em_dash(
         f"<p>{greeting}</p>\n"
         f"<p>{body}</p>\n"
         f"<p>{callout}</p>\n"
@@ -1187,6 +1235,90 @@ def run_send(dry_run=False):
 
 
 # =============================================================================
+# Self-Test
+# =============================================================================
+# Fast, dependency-free assertions on the tricky template edge cases that
+# have bitten this codebase (abbreviation handling, cp1252 encoding, greeting
+# rules). Run with: python cold_email_agent.py --self-test
+# The suite MUST pass before any PR that touches templating is merged --
+# see memory.md Lessons 2026-04-14 (v5.1 "Inc." double-period incident) and
+# 2026-04-16 (v6 conditional-rstrip).
+
+def _self_test():
+    print("  [self-test] business name cleanup")
+    assert _clean_business_name("Joe's Pizza Inc.") == "Joe's Pizza Inc"
+    assert _clean_business_name("Acme Corp.") == "Acme Corp"
+    assert _clean_business_name("Smith LLC.") == "Smith LLC"
+    # Co. / Ltd. / Co-op / trailing periods that ARE part of the name stay
+    assert _clean_business_name("Oakridge Smile Co.") == "Oakridge Smile Co."
+    assert _clean_business_name("Hartman Dental Ltd.") == "Hartman Dental Ltd."
+    assert _clean_business_name("Ottawa Dental Co-op") == "Ottawa Dental Co-op"
+    assert _clean_business_name("Plain Name") == "Plain Name"
+    assert _clean_business_name("") == ""
+
+    print("  [self-test] em-dash renderer")
+    assert "\u2014" in _to_em_dash("Foo -- Bar")
+    assert "\u2014 Franco" in _to_em_dash("-- Franco")
+    # Leave source '--' inside words or without surrounding spaces alone
+    assert _to_em_dash("call-for-quote") == "call-for-quote"
+    # Idempotent -- running twice shouldn't double-convert
+    assert _to_em_dash(_to_em_dash("Foo -- Bar")) == _to_em_dash("Foo -- Bar")
+
+    print("  [self-test] greeting rules (credentialed professionals)")
+    # Credentialed with last name -> Dr. Lastname
+    p = {"name":"Test","cat":"Dental & Medical","email":"x@y.com",
+         "owner_name":"Dr. Priya Patel","credentials":"DDS MSc"}
+    e = generate_email(p)
+    assert e["body_text"].startswith("Hi Dr. Patel,"), \
+        f"Expected Dr. Patel greeting, got: {e['body_text'][:40]!r}"
+    # Credentialed with DMD
+    p["credentials"] = "DMD"; p["owner_name"] = "Dr. Alan Chen"
+    e = generate_email(p)
+    assert e["body_text"].startswith("Hi Dr. Chen,")
+    # Credentialed with only first name -> Hi there (never hang the title)
+    p["owner_name"] = "Dr. Mike"; p["credentials"] = "DDS"
+    e = generate_email(p)
+    assert e["body_text"].startswith("Hi there,"), \
+        f"Hanging-title fallback expected, got: {e['body_text'][:40]!r}"
+    # Non-credentialed with first + last -> first name only
+    p = {"name":"Test","cat":"Trades","email":"x@y.com",
+         "owner_name":"Matt Rossi"}
+    e = generate_email(p)
+    assert e["body_text"].startswith("Hi Matt,")
+    # Non-credentialed, first name only
+    p["owner_name"] = "Sam"
+    e = generate_email(p)
+    assert e["body_text"].startswith("Hi Sam,")
+    # No owner -> Hi there
+    p["owner_name"] = None
+    e = generate_email(p)
+    assert e["body_text"].startswith("Hi there,")
+
+    print("  [self-test] paused vertical raises via generate_email None")
+    assert generate_email({"name":"Pizza","cat":"Restaurants",
+                           "email":"x@y.com"}) is None
+
+    print("  [self-test] em-dash appears in rendered body")
+    p = {"name":"Peel Plumbing Inc.","cat":"Trades","email":"x@y.com",
+         "owner_name":"Matt Rossi","rating":4.9,"review_count":126}
+    e = generate_email(p)
+    assert "\u2014" in e["body_text"], "rendered body should use em-dash"
+    assert "\u2014" in e["body_html"]
+    # And sign-off should be em-dash too
+    assert e["body_text"].rstrip().endswith("\u2014 Franco")
+
+    print("  [self-test] fallback observation is diagnostic, not hedging")
+    p = {"name":"Test","cat":"Dental & Medical","email":"x@y.com",
+         "manual_work_signal":""}
+    e = generate_email(p)
+    assert "Took a look at your site" in e["body_text"]
+    assert "I poked around" not in e["body_text"]
+    assert "looks like it still" not in e["body_text"]
+
+    print("  [self-test] ALL TESTS PASSED")
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -1206,11 +1338,17 @@ def main():
                         help="Send approved emails via Resend")
     parser.add_argument("--mark-sent", type=str, dest="mark_sent",
                         help="Manually flip a queue entry to 'sent' by id")
+    parser.add_argument("--self-test", action="store_true", dest="self_test",
+                        help="Run tone/template assertions and exit")
     parser.add_argument("--max", "-m", type=int, default=50,
                         help="Max items per run (default: 50)")
     parser.add_argument("--dry-run", "-d", action="store_true",
                         help="Preview without writing")
     args = parser.parse_args()
+
+    if args.self_test:
+        _self_test()
+        return
 
     if args.mark_sent:
         ok = mark_sent(args.mark_sent)
@@ -1221,7 +1359,8 @@ def main():
              args.loom_recorded, args.send]
     if not any(modes):
         print("Error: must specify --draft / --redraft / --follow-ups / "
-              "--loom-script / --loom-recorded / --send / --mark-sent")
+              "--loom-script / --loom-recorded / --send / --mark-sent / "
+              "--self-test")
         parser.print_help()
         sys.exit(1)
 
